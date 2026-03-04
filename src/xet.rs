@@ -124,6 +124,11 @@ impl StagingDir {
         }
     }
 
+    /// Root directory of the staging area.
+    pub fn root(&self) -> &Path {
+        &self.dir
+    }
+
     /// Get the staging path for a given inode.
     /// Deterministic within a session but unpredictable from outside.
     pub fn path(&self, inode: u64) -> PathBuf {

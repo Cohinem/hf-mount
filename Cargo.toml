@@ -18,7 +18,8 @@ merklehash = { git = "https://github.com/huggingface/xet-core.git", rev = "4af99
 # External crates
 fuser = { version = "0.17", features = ["macos-no-mount"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -30,6 +31,15 @@ bytes = "1"
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 nfsserve = { version = "0.10", optional = true }
+
+[[bin]]
+name = "hf-mount-fuse"
+path = "src/bin/hf-mount-fuse.rs"
+
+[[bin]]
+name = "hf-mount-nfs"
+path = "src/bin/hf-mount-nfs.rs"
+required-features = ["nfs"]
 
 [features]
 nfs = ["dep:nfsserve"]

@@ -184,7 +184,7 @@ async fn test_fio_compare() {
     eprintln!("============================================================");
 
     let nfs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child = common::mount_bucket(&bucket_id, &nfs_mount, &nfs_cache, &["--backend=nfs", "--read-only"]);
+        let child = common::mount_bucket_nfs(&bucket_id, &nfs_mount, &nfs_cache, &["--read-only"]);
         run_fio_suite(&nfs_mount);
         common::unmount_nfs(&nfs_mount, child, 5);
     }));

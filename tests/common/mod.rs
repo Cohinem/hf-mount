@@ -170,7 +170,7 @@ pub async fn upload_file(
     file_info
 }
 
-/// Spawn hf-mount as a child process, wait until the mountpoint is live.
+/// Spawn hf-mount-fuse as a child process, wait until the mountpoint is live.
 /// `extra_args` are appended to the command (e.g. `&["--read-only"]`).
 pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
     let token = std::env::var("HF_TOKEN").unwrap();
@@ -181,7 +181,7 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
         .unwrap()
         .parent()
         .unwrap()
-        .join("hf-mount");
+        .join("hf-mount-fuse");
 
     eprintln!("Mounting with binary: {:?}", binary);
 
@@ -190,10 +190,6 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
 
     let child = Command::new(binary)
         .args([
-            "--bucket-id",
-            bucket_id,
-            "--mount-point",
-            mount_point,
             "--hf-token",
             &token,
             "--cache-dir",
@@ -202,8 +198,104 @@ pub fn mount_bucket(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_a
             "0",
         ])
         .args(extra_args)
+        .args(["bucket", bucket_id, mount_point])
         .spawn()
-        .expect("Failed to spawn hf-mount");
+        .expect("Failed to spawn hf-mount-fuse");
+
+    for i in 0..30 {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
+            && mounts.lines().any(|line| line.contains(mount_point))
+        {
+            eprintln!("Mount ready after {}ms", (i + 1) * 500);
+            return child;
+        }
+    }
+
+    eprintln!("Warning: mount may not be ready after 15s");
+    child
+}
+
+/// Spawn hf-mount-fuse to mount a repo as read-only, wait until the mountpoint is live.
+pub fn mount_repo(repo_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
+    let token = std::env::var("HF_TOKEN").unwrap();
+
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("hf-mount-fuse");
+
+    eprintln!("Mounting repo with binary: {:?}", binary);
+
+    std::fs::create_dir_all(mount_point).ok();
+    std::fs::create_dir_all(cache_dir).ok();
+
+    let child = Command::new(binary)
+        .args([
+            "--hf-token",
+            &token,
+            "--cache-dir",
+            cache_dir,
+            "--poll-interval-secs",
+            "0",
+        ])
+        .args(extra_args)
+        .args(["repo", repo_id, mount_point])
+        .spawn()
+        .expect("Failed to spawn hf-mount-fuse");
+
+    for i in 0..30 {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts")
+            && mounts.lines().any(|line| line.contains(mount_point))
+        {
+            eprintln!("Mount ready after {}ms", (i + 1) * 500);
+            return child;
+        }
+    }
+
+    eprintln!("Warning: mount may not be ready after 15s");
+    child
+}
+
+/// Spawn hf-mount-nfs to mount a bucket via NFS.
+pub fn mount_bucket_nfs(bucket_id: &str, mount_point: &str, cache_dir: &str, extra_args: &[&str]) -> Child {
+    let token = std::env::var("HF_TOKEN").unwrap();
+
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("hf-mount-nfs");
+
+    eprintln!("Mounting NFS with binary: {:?}", binary);
+
+    if !binary.exists() {
+        eprintln!("NFS binary not found (build with --features nfs)");
+        panic!("hf-mount-nfs binary not found");
+    }
+
+    std::fs::create_dir_all(mount_point).ok();
+    std::fs::create_dir_all(cache_dir).ok();
+
+    let child = Command::new(binary)
+        .args([
+            "--hf-token",
+            &token,
+            "--cache-dir",
+            cache_dir,
+            "--poll-interval-secs",
+            "0",
+        ])
+        .args(extra_args)
+        .args(["bucket", bucket_id, mount_point])
+        .spawn()
+        .expect("Failed to spawn hf-mount-nfs");
 
     for i in 0..30 {
         std::thread::sleep(Duration::from_millis(500));

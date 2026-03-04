@@ -27,6 +27,8 @@ const NEG_CACHE_CAPACITY: usize = 10_000;
 const NEG_CACHE_TTL: Duration = Duration::from_secs(30);
 
 type Invalidator = Arc<Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>>;
+type CommitHookTx = tokio::sync::watch::Sender<Option<Result<(), i32>>>;
+type CommitHookRx = tokio::sync::watch::Receiver<Option<Result<(), i32>>>;
 
 // ── VirtualFs ──────────────────────────────────────────────────────────
 
@@ -49,7 +51,7 @@ pub struct VirtualFs {
     staging_locks: Mutex<HashMap<u64, Arc<tokio::sync::Mutex<()>>>>,
     /// Per-inode pending commit receivers. release() publishes the commit result here;
     /// open() awaits it instead of blindly blocking on staging_lock.
-    pending_commits: Mutex<HashMap<u64, tokio::sync::watch::Receiver<Option<Result<(), i32>>>>>,
+    pending_commits: Mutex<HashMap<u64, CommitHookRx>>,
     /// Debounced batch flush pipeline (None when read_only).
     flush_manager: Option<crate::flush::FlushManager>,
     /// Background poll task handle, taken in shutdown().
@@ -67,6 +69,7 @@ pub struct VirtualFs {
     serve_lookup_from_cache: bool,
 }
 
+/// Where to read file content from when opening read-only.
 impl VirtualFs {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -383,12 +386,11 @@ impl VirtualFs {
         // When false (minimal mode), always HEAD on every lookup.
         if self.serve_lookup_from_cache {
             let inodes = self.inode_table.read().expect("inodes poisoned");
-            if let Some(entry) = inodes.get(ino) {
-                if let Some(last) = entry.last_revalidated {
-                    if last.elapsed() < self.metadata_ttl {
-                        return;
-                    }
-                }
+            if let Some(entry) = inodes.get(ino)
+                && let Some(last) = entry.last_revalidated
+                && last.elapsed() < self.metadata_ttl
+            {
+                return;
             }
         }
 
@@ -861,20 +863,12 @@ impl VirtualFs {
             return Err(libc::EROFS);
         }
 
-        let (xet_hash, size, is_dirty) = {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            let entry = match inodes.get(ino) {
-                Some(e) if e.kind == InodeKind::File => e,
-                _ => return Err(libc::ENOENT),
-            };
-            (entry.xet_hash.clone().unwrap_or_default(), entry.size, entry.dirty)
-        };
-
+        let file_entry = self.get_file_entry(ino)?;
         let staging_path = self.staging_dir.as_ref().map(|sd| sd.path(ino));
 
         if writable && self.advanced_writes {
             // Staging file + async flush (supports random writes and seek)
-            self.open_advanced_write(ino, &xet_hash, size, staging_path, truncate)
+            self.open_advanced_write(ino, &file_entry.xet_hash, file_entry.size, staging_path, truncate)
                 .await
         } else if writable && truncate {
             // Simple streaming write (append-only, synchronous commit on close)
@@ -883,8 +877,7 @@ impl VirtualFs {
             // Simple mode without O_TRUNC: random writes not supported
             Err(libc::EPERM)
         } else {
-            // Read-only: staging file, pending commit, or lazy remote read
-            self.open_readonly(ino, &xet_hash, size, is_dirty, staging_path).await
+            self.open_readonly(ino, file_entry, staging_path).await
         }
     }
 
@@ -1002,52 +995,47 @@ impl VirtualFs {
         Ok(file_handle)
     }
 
-    /// Open a file for reading. Handles dirty staging files, pending commits, and lazy remote reads.
-    async fn open_readonly(
-        &self,
-        ino: u64,
-        xet_hash: &str,
-        size: u64,
-        is_dirty: bool,
-        staging_path: Option<PathBuf>,
-    ) -> VirtualFsResult<u64> {
-        // Dirty file not yet flushed → read from local staging (advanced mode only)
-        if let Some(ref staging_path) = staging_path
-            && is_dirty
-            && staging_path.exists()
-        {
-            return self.open_local_readonly(ino, staging_path);
+    /// Open a file for reading. Dispatches based on where the content lives.
+    async fn open_readonly(&self, ino: u64, fe: FileEntry, staging_path: Option<PathBuf>) -> VirtualFsResult<u64> {
+        match (fe.dirty, &staging_path) {
+            // Advanced write in progress — read from local staging file.
+            (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path),
+
+            // Streaming write in progress (simple mode) — wait for commit.
+            (true, None) if fe.xet_hash.is_empty() && fe.size > 0 => {
+                self.await_pending_commit(ino).await?;
+                let fe = self.get_file_entry(ino)?;
+                self.open_lazy(fe.xet_hash, fe.size)
+            }
+
+            // Remote xet-backed file — lazy CAS range reads.
+            _ if !fe.xet_hash.is_empty() => self.open_lazy(fe.xet_hash, fe.size),
+
+            // Plain LFS/git file without xet hash — HTTP download to staging cache.
+            _ if fe.size > 0 => {
+                let staging = self.staging_dir.as_ref().ok_or_else(|| {
+                    error!("No staging dir for HTTP download of ino={}", ino);
+                    libc::EIO
+                })?;
+                let mtime_ms = fe.mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+                let dest = staging
+                    .root()
+                    .join(format!("http_{:x}_s{}_t{}", ino, fe.size, mtime_ms));
+                if !dest.exists() {
+                    self.hub_client
+                        .download_file_http(&fe.full_path, &dest)
+                        .await
+                        .map_err(|e| {
+                            error!("HTTP download failed for {}: {}", fe.full_path, e);
+                            libc::EIO
+                        })?;
+                }
+                self.open_local_readonly(ino, &dest)
+            }
+
+            // Empty file (size=0, no hash).
+            _ => self.open_lazy(String::new(), 0),
         }
-
-        // Dirty file in simple mode (no staging): a streaming commit may be
-        // in progress in release(). Await the pending commit result if one exists,
-        // then re-read the inode to pick up the xet_hash set by streaming_commit.
-        if is_dirty && staging_path.is_none() && xet_hash.is_empty() && size > 0 {
-            self.await_pending_commit(ino).await?;
-
-            // Re-read inode after commit completed (or reverted) and return
-            // directly with fresh values — the original xet_hash/size are stale.
-            let (new_xet_hash, new_size) = {
-                let inodes = self.inode_table.read().expect("inodes poisoned");
-                let entry = inodes.get(ino).ok_or(libc::ENOENT)?;
-                (entry.xet_hash.clone().unwrap_or_default(), entry.size)
-            };
-            return self.open_lazy(new_xet_hash, new_size);
-        }
-
-        // Remote file with xet hash → lazy range reads via prefetch buffer
-        if !xet_hash.is_empty() {
-            return self.open_lazy(xet_hash.to_string(), size);
-        }
-
-        // No hash + non-empty → inconsistent state
-        if size > 0 {
-            error!("No xet hash for non-empty, non-dirty file ino={}", ino);
-            return Err(libc::EIO);
-        }
-
-        // Empty file (size=0, no hash)
-        self.open_lazy(String::new(), 0)
     }
 
     /// Allocate a lazy file handle backed by a prefetch buffer.
@@ -1368,16 +1356,16 @@ impl VirtualFs {
 
             // PID-aware deferral: if the flushing process isn't the opener,
             // this is a dup'd fd (e.g. shell redirection) — defer to release().
-            if let (Some(open_pid), Some(flush_pid)) = (channel.open_pid, pid) {
-                if !same_process(open_pid, flush_pid) {
-                    debug!(
-                        "flush: deferring commit for ino={} (open_pid={}, flush_pid={})",
-                        ino, open_pid, flush_pid
-                    );
-                    self.install_commit_hook(ino, &channel);
-                    *channel.state.lock().unwrap() = CommitState::Deferred;
-                    return Ok(());
-                }
+            if let (Some(open_pid), Some(flush_pid)) = (channel.open_pid, pid)
+                && !same_process(open_pid, flush_pid)
+            {
+                debug!(
+                    "flush: deferring commit for ino={} (open_pid={}, flush_pid={})",
+                    ino, open_pid, flush_pid
+                );
+                self.install_commit_hook(ino, &channel);
+                *channel.state.lock().unwrap() = CommitState::Deferred;
+                return Ok(());
             }
 
             // Secondary gate: skip commit if no data was written (covers NFS
@@ -2215,6 +2203,22 @@ impl VirtualFs {
             None => Err(libc::ENOENT),
         }
     }
+
+    /// Read a file inode's fields into a `FileEntry` snapshot.
+    fn get_file_entry(&self, ino: u64) -> VirtualFsResult<FileEntry> {
+        let inodes = self.inode_table.read().expect("inodes poisoned");
+        let entry = match inodes.get(ino) {
+            Some(e) if e.kind == InodeKind::File => e,
+            _ => return Err(libc::ENOENT),
+        };
+        Ok(FileEntry {
+            xet_hash: entry.xet_hash.clone().unwrap_or_default(),
+            size: entry.size,
+            dirty: entry.dirty,
+            full_path: entry.full_path.clone(),
+            mtime: entry.mtime,
+        })
+    }
 }
 
 // ── VFS types ──────────────────────────────────────────────────────────
@@ -2253,6 +2257,15 @@ struct RenameInfo {
 }
 
 // ── Internal types ─────────────────────────────────────────────────────
+
+/// Snapshot of file inode fields captured under a short-lived read lock.
+struct FileEntry {
+    xet_hash: String,
+    size: u64,
+    dirty: bool,
+    full_path: String,
+    mtime: SystemTime,
+}
 
 /// State machine for streaming writes.
 /// Message sent from the write() caller to the background streaming worker.
@@ -2302,7 +2315,7 @@ struct StreamingChannel {
     snapshot: InodeSnapshot,
     /// Watch sender for the pending commit hook. Created in flush() on deferral,
     /// fulfilled in release() when the commit completes (or fails).
-    commit_hook: std::sync::Mutex<Option<tokio::sync::watch::Sender<Option<Result<(), i32>>>>>,
+    commit_hook: std::sync::Mutex<Option<CommitHookTx>>,
 }
 
 /// An open file handle — either a local fd, lazy remote reference, or streaming writer.

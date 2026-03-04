@@ -38,7 +38,7 @@ async fn test_bench() {
     let nfs_cache = format!("/tmp/hf-bench-nfs-cache-{}", pid);
 
     let nfs_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let child = common::mount_bucket(&bucket_id, &nfs_mount, &nfs_cache, &["--backend=nfs", "--read-only"]);
+        let child = common::mount_bucket_nfs(&bucket_id, &nfs_mount, &nfs_cache, &["--read-only"]);
         let r = common::bench::run_read_benchmarks(&nfs_mount, &test_filename, &expected);
         common::unmount_nfs(&nfs_mount, child, 5);
         r
