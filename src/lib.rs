@@ -10,3 +10,6 @@ mod prefetch;
 pub mod setup;
 pub mod virtual_fs;
 pub mod xet;
+
+#[cfg(test)]
+pub(crate) mod test_mocks;

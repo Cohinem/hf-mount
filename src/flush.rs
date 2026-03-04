@@ -6,17 +6,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use crate::hub_api::{BatchOp, HubApiClient};
+use crate::hub_api::{BatchOp, HubOps};
 use crate::inode::InodeTable;
-use crate::xet::{StagingDir, XetSessions};
-
-// ── Constants ──────────────────────────────────────────────────────────
-
-/// Minimum delay before a flush batch fires after the first dirty file is enqueued.
-const DEBOUNCE_DURATION: Duration = Duration::from_secs(2);
-/// Maximum time a dirty file can sit in the queue before being flushed,
-/// regardless of debounce resets from new writes.
-const MAX_BATCH_WINDOW: Duration = Duration::from_secs(30);
+use crate::xet::{StagingDir, XetOps};
 
 type FlushRequest = u64;
 
@@ -30,17 +22,28 @@ pub(crate) struct FlushManager {
 
 impl FlushManager {
     pub(crate) fn new(
-        xet_sessions: Arc<XetSessions>,
+        xet_sessions: Arc<dyn XetOps>,
         staging_dir: StagingDir,
-        hub_client: Arc<HubApiClient>,
+        hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
         runtime: &tokio::runtime::Handle,
+        debounce: Duration,
+        max_batch_window: Duration,
     ) -> Self {
         let errors = Arc::new(Mutex::new(HashMap::new()));
         let (tx, rx) = mpsc::unbounded_channel::<FlushRequest>();
 
         let bg_errors = errors.clone();
-        let handle = runtime.spawn(flush_loop(rx, xet_sessions, staging_dir, hub_client, inodes, bg_errors));
+        let handle = runtime.spawn(flush_loop(
+            rx,
+            xet_sessions,
+            staging_dir,
+            hub_client,
+            inodes,
+            bg_errors,
+            debounce,
+            max_batch_window,
+        ));
 
         Self {
             tx: Mutex::new(Some(tx)),
@@ -92,13 +95,16 @@ impl FlushManager {
 
 // ── Background tasks ──────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_loop(
     mut rx: mpsc::UnboundedReceiver<FlushRequest>,
-    xet_sessions: Arc<XetSessions>,
+    xet_sessions: Arc<dyn XetOps>,
     staging_dir: StagingDir,
-    hub_client: Arc<HubApiClient>,
+    hub_client: Arc<dyn HubOps>,
     inodes: Arc<RwLock<InodeTable>>,
     flush_errors: Arc<Mutex<HashMap<u64, String>>>,
+    debounce: Duration,
+    max_batch_window: Duration,
 ) {
     loop {
         // Wait for the first request
@@ -109,15 +115,15 @@ async fn flush_loop(
 
         let mut pending = vec![first];
 
-        // Debounce: keep collecting for DEBOUNCE_DURATION after each new item,
-        // but cap total wait at MAX_BATCH_WINDOW to avoid unbounded delay.
-        let window_deadline = tokio::time::Instant::now() + MAX_BATCH_WINDOW;
+        // Debounce: keep collecting for debounce duration after each new item,
+        // but cap total wait at max_batch_window to avoid unbounded delay.
+        let window_deadline = tokio::time::Instant::now() + max_batch_window;
         loop {
             let remaining = window_deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            let timeout = DEBOUNCE_DURATION.min(remaining);
+            let timeout = debounce.min(remaining);
             match tokio::time::timeout(timeout, rx.recv()).await {
                 Ok(Some(req)) => pending.push(req),
                 _ => break, // timeout (debounce expired) or channel closed
@@ -129,9 +135,9 @@ async fn flush_loop(
 
         flush_batch(
             pending,
-            &xet_sessions,
+            &*xet_sessions,
             &staging_dir,
-            &hub_client,
+            &*hub_client,
             &inodes,
             &flush_errors,
         )
@@ -141,9 +147,9 @@ async fn flush_loop(
 
 async fn flush_batch(
     pending: Vec<FlushRequest>,
-    xet_sessions: &XetSessions,
+    xet_sessions: &dyn XetOps,
     staging_dir: &StagingDir,
-    hub_client: &HubApiClient,
+    hub_client: &dyn HubOps,
     inodes: &RwLock<InodeTable>,
     flush_errors: &Mutex<HashMap<u64, String>>,
 ) {

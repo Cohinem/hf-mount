@@ -90,6 +90,16 @@ pub struct Args {
     /// Maximum number of FUSE worker threads
     #[arg(long, default_value_t = 16)]
     pub max_threads: usize,
+
+    /// Flush debounce delay in milliseconds. After the first dirty file is
+    /// enqueued, the flush batch waits this long for more writes before firing.
+    #[arg(long, default_value_t = 2_000)]
+    pub flush_debounce_ms: u64,
+
+    /// Maximum flush batch window in milliseconds. A dirty file will be flushed
+    /// within this time regardless of ongoing writes resetting the debounce.
+    #[arg(long, default_value_t = 30_000)]
+    pub flush_max_batch_window_ms: u64,
 }
 
 /// Everything needed to run a mount backend (FUSE or NFS).
@@ -248,6 +258,8 @@ pub fn setup(is_nfs: bool) -> MountSetup {
         args.poll_interval_secs,
         metadata_ttl,
         !args.metadata_ttl_minimal,
+        std::time::Duration::from_millis(args.flush_debounce_ms),
+        std::time::Duration::from_millis(args.flush_max_batch_window_ms),
     );
 
     MountSetup {

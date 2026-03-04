@@ -92,14 +92,14 @@ async fn test_fuse_revalidation() {
     let mount_point = format!("/tmp/hf-mount-fuse-reval-{}", std::process::id());
     let cache_dir = format!("/tmp/hf-mount-fuse-reval-cache-{}", std::process::id());
 
-    let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &[]);
+    let child = common::mount_bucket(&bucket_id, &mount_point, &cache_dir, &["--metadata-ttl-ms", "100"]);
 
     let result = common::fs_tests::run_revalidation_test(
         &mount_point,
         &remote_file,
         &test_content,
         &hub,
-        100, // metadata_ttl_ms (default)
+        100, // metadata_ttl_ms
     )
     .await;
 

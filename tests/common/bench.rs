@@ -1,6 +1,8 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::{Duration, Instant};
 
+use hf_mount::xet::XetOps;
+
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct BenchResult {
@@ -205,7 +207,7 @@ pub async fn run_raw_cleaner_benchmark(xet: &hf_mount::xet::XetSessions, size_by
     let mbps = size_mb / elapsed.as_secs_f64();
 
     // Finish to clean up the session
-    let _ = writer.finish().await;
+    let _ = writer.finish_boxed().await;
 
     Ok(mbps)
 }

@@ -11,6 +11,21 @@ use utils::errors::AuthError;
 
 use crate::error::{Error, Result};
 
+// ── HubOps trait ──────────────────────────────────────────────────────
+
+/// Trait abstracting the Hub API operations used by VirtualFs and FlushManager.
+/// Production code uses `HubApiClient`; tests inject mocks.
+#[async_trait::async_trait]
+pub trait HubOps: Send + Sync {
+    async fn list_tree(&self, prefix: &str, recursive: bool) -> Result<Vec<TreeEntry>>;
+    async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>>;
+    async fn batch_operations(&self, ops: &[BatchOp]) -> Result<()>;
+    async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()>;
+    fn default_mtime(&self) -> SystemTime;
+    fn source(&self) -> &SourceKind;
+    fn is_repo(&self) -> bool;
+}
+
 // ── Repo / Bucket types ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -93,7 +108,7 @@ impl std::fmt::Display for SourceKind {
 
 // ── Shared data types ─────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum BatchOp {
     #[serde(rename_all = "camelCase")]
@@ -242,10 +257,7 @@ impl HubApiClient {
                 if resolved_id != repo_id {
                     info!("Resolved repo alias: {} → {}", repo_id, resolved_id);
                 }
-                let last_modified = body["lastModified"]
-                    .as_str()
-                    .map(Self::mtime_from_str)
-                    .unwrap_or(UNIX_EPOCH);
+                let last_modified = body["lastModified"].as_str().map(mtime_from_str).unwrap_or(UNIX_EPOCH);
                 (
                     SourceKind::Repo {
                         repo_id: resolved_id.to_string(),
@@ -266,10 +278,7 @@ impl HubApiClient {
                     )));
                 }
                 let body: serde_json::Value = resp.json().await?;
-                let last_modified = body["updatedAt"]
-                    .as_str()
-                    .map(Self::mtime_from_str)
-                    .unwrap_or(UNIX_EPOCH);
+                let last_modified = body["updatedAt"].as_str().map(mtime_from_str).unwrap_or(UNIX_EPOCH);
                 (SourceKind::Bucket { bucket_id }, last_modified)
             }
         };
@@ -313,28 +322,19 @@ impl HubApiClient {
     }
 
     /// List tree entries at the given prefix (follows `Link` header pagination).
-    /// For repos this returns a single directory level; for buckets it's recursive.
-    pub async fn list_tree(&self, prefix: &str) -> Result<Vec<TreeEntry>> {
+    /// When `recursive` is true, returns all entries under the prefix;
+    /// otherwise returns a single directory level.
+    pub async fn list_tree(&self, prefix: &str, recursive: bool) -> Result<Vec<TreeEntry>> {
         match &self.source {
             SourceKind::Bucket { bucket_id } => self.list_tree_bucket(bucket_id, prefix).await,
             SourceKind::Repo {
                 repo_id,
                 repo_type,
                 revision,
-            } => self.list_tree_repo(repo_id, *repo_type, revision, prefix, false).await,
-        }
-    }
-
-    /// List all tree entries recursively (for poll loop).
-    /// For buckets, list_tree is already recursive. For repos, uses `?recursive=true`.
-    pub async fn list_tree_recursive(&self) -> Result<Vec<TreeEntry>> {
-        match &self.source {
-            SourceKind::Bucket { bucket_id } => self.list_tree_bucket(bucket_id, "").await,
-            SourceKind::Repo {
-                repo_id,
-                repo_type,
-                revision,
-            } => self.list_tree_repo(repo_id, *repo_type, revision, "", true).await,
+            } => {
+                self.list_tree_repo(repo_id, *repo_type, revision, prefix, recursive)
+                    .await
+            }
         }
     }
 
@@ -713,22 +713,47 @@ impl HubApiClient {
             kind,
         })
     }
+}
 
-    pub fn mtime_from_str(s: &str) -> SystemTime {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .ok()
-            .and_then(|dt| u64::try_from(dt.timestamp()).ok())
-            .map(|secs| UNIX_EPOCH + std::time::Duration::from_secs(secs))
-            .unwrap_or(UNIX_EPOCH)
+pub fn mtime_from_str(s: &str) -> SystemTime {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .and_then(|dt| u64::try_from(dt.timestamp()).ok())
+        .map(|secs| UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        .unwrap_or(UNIX_EPOCH)
+}
+
+/// Parse HTTP-date format (e.g. "Sat, 28 Feb 2026 14:52:39 GMT") from Last-Modified header.
+pub fn mtime_from_http_date(s: &str) -> SystemTime {
+    chrono::DateTime::parse_from_rfc2822(s)
+        .ok()
+        .and_then(|dt| u64::try_from(dt.timestamp()).ok())
+        .map(|secs| UNIX_EPOCH + std::time::Duration::from_secs(secs))
+        .unwrap_or(UNIX_EPOCH)
+}
+
+#[async_trait::async_trait]
+impl HubOps for HubApiClient {
+    async fn list_tree(&self, prefix: &str, recursive: bool) -> Result<Vec<TreeEntry>> {
+        self.list_tree(prefix, recursive).await
     }
-
-    /// Parse HTTP-date format (e.g. "Sat, 28 Feb 2026 14:52:39 GMT") from Last-Modified header.
-    pub fn mtime_from_http_date(s: &str) -> SystemTime {
-        chrono::DateTime::parse_from_rfc2822(s)
-            .ok()
-            .and_then(|dt| u64::try_from(dt.timestamp()).ok())
-            .map(|secs| UNIX_EPOCH + std::time::Duration::from_secs(secs))
-            .unwrap_or(UNIX_EPOCH)
+    async fn head_file(&self, path: &str) -> Result<Option<HeadFileInfo>> {
+        self.head_file(path).await
+    }
+    async fn batch_operations(&self, ops: &[BatchOp]) -> Result<()> {
+        self.batch_operations(ops).await
+    }
+    async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()> {
+        self.download_file_http(path, dest).await
+    }
+    fn default_mtime(&self) -> SystemTime {
+        self.default_mtime()
+    }
+    fn source(&self) -> &SourceKind {
+        self.source()
+    }
+    fn is_repo(&self) -> bool {
+        self.is_repo()
     }
 }
 
@@ -863,14 +888,14 @@ mod tests {
 
     #[test]
     fn test_mtime_parsers_fallback_to_unix_epoch_on_invalid_input() {
-        assert_eq!(HubApiClient::mtime_from_str("not-a-date"), UNIX_EPOCH);
-        assert_eq!(HubApiClient::mtime_from_http_date("still-not-a-date"), UNIX_EPOCH);
+        assert_eq!(mtime_from_str("not-a-date"), UNIX_EPOCH);
+        assert_eq!(mtime_from_http_date("still-not-a-date"), UNIX_EPOCH);
     }
 
     #[test]
     fn test_mtime_parsers_support_valid_formats() {
-        let rfc3339 = HubApiClient::mtime_from_str("2026-02-28T14:52:39Z");
-        let http_date = HubApiClient::mtime_from_http_date("Sat, 28 Feb 2026 14:52:39 GMT");
+        let rfc3339 = mtime_from_str("2026-02-28T14:52:39Z");
+        let http_date = mtime_from_http_date("Sat, 28 Feb 2026 14:52:39 GMT");
         assert!(rfc3339 > UNIX_EPOCH);
         assert!(http_date > UNIX_EPOCH);
         assert_eq!(rfc3339, http_date);

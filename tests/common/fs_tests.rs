@@ -365,7 +365,7 @@ pub async fn verify_hub_state(
 ) -> Result<(), String> {
     eprintln!("=== Verifying Hub state after flush ===");
 
-    let entries = hub.list_tree("").await.map_err(|e| format!("list_tree: {e}"))?;
+    let entries = hub.list_tree("", false).await.map_err(|e| format!("list_tree: {e}"))?;
     let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
     eprintln!("  Hub files: {:?}", paths);
 
@@ -732,7 +732,7 @@ pub async fn verify_simple_hub_state(
 ) -> Result<(), String> {
     eprintln!("=== Verifying Hub state (simple mode) ===");
 
-    let entries = hub.list_tree("").await.map_err(|e| format!("list_tree: {e}"))?;
+    let entries = hub.list_tree("", false).await.map_err(|e| format!("list_tree: {e}"))?;
     let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
     eprintln!("  Hub files: {:?}", paths);
 

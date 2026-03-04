@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,10 +10,10 @@ use bytes::{Bytes, BytesMut};
 use data::XetFileInfo;
 use tracing::{debug, error, info, warn};
 
-use crate::hub_api::{BatchOp, HubApiClient};
+use crate::hub_api::{BatchOp, HubOps};
 use crate::inode::{InodeEntry, InodeKind, InodeTable};
 use crate::prefetch::PrefetchState;
-use crate::xet::{StagingDir, StreamingWriter, XetSessions};
+use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -34,8 +33,8 @@ type CommitHookRx = tokio::sync::watch::Receiver<Option<Result<(), i32>>>;
 
 pub struct VirtualFs {
     runtime: tokio::runtime::Handle,
-    hub_client: Arc<HubApiClient>,
-    xet_sessions: Arc<XetSessions>,
+    hub_client: Arc<dyn HubOps>,
+    xet_sessions: Arc<dyn XetOps>,
     staging_dir: Option<StagingDir>,
     read_only: bool,
     advanced_writes: bool,
@@ -74,8 +73,8 @@ impl VirtualFs {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         runtime: tokio::runtime::Handle,
-        hub_client: Arc<HubApiClient>,
-        xet_sessions: Arc<XetSessions>,
+        hub_client: Arc<dyn HubOps>,
+        xet_sessions: Arc<dyn XetOps>,
         staging_dir: Option<StagingDir>,
         read_only: bool,
         advanced_writes: bool,
@@ -84,6 +83,8 @@ impl VirtualFs {
         poll_interval_secs: u64,
         metadata_ttl: Duration,
         serve_lookup_from_cache: bool,
+        flush_debounce: Duration,
+        flush_max_batch_window: Duration,
     ) -> Arc<Self> {
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
@@ -98,6 +99,8 @@ impl VirtualFs {
                 hub_client.clone(),
                 inodes.clone(),
                 &runtime,
+                flush_debounce,
+                flush_max_batch_window,
             ))
         } else {
             None
@@ -195,7 +198,7 @@ impl VirtualFs {
 
     /// Background task: polls Hub API tree listing to detect remote changes.
     async fn poll_remote_changes(
-        hub_client: Arc<HubApiClient>,
+        hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
         negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: Invalidator,
@@ -204,7 +207,7 @@ impl VirtualFs {
         loop {
             tokio::time::sleep(interval).await;
 
-            let remote_entries = match hub_client.list_tree_recursive().await {
+            let remote_entries = match hub_client.list_tree("", true).await {
                 Ok(entries) => entries,
                 Err(e) => {
                     warn!("Remote poll failed: {}", e);
@@ -253,7 +256,7 @@ impl VirtualFs {
                             let mtime = remote
                                 .mtime
                                 .as_deref()
-                                .map(HubApiClient::mtime_from_str)
+                                .map(crate::hub_api::mtime_from_str)
                                 .unwrap_or(SystemTime::now());
                             updates.push(Update {
                                 ino: *ino,
@@ -458,7 +461,7 @@ impl VirtualFs {
                     let remote_mtime = head_info
                         .last_modified
                         .as_deref()
-                        .map(HubApiClient::mtime_from_http_date)
+                        .map(crate::hub_api::mtime_from_http_date)
                         .unwrap_or(SystemTime::now());
                     debug!("Remote change detected via HEAD: {}", full_path);
                     inodes.update_remote_file(
@@ -502,7 +505,7 @@ impl VirtualFs {
             }
         };
 
-        let entries = match self.hub_client.list_tree(&prefix).await {
+        let entries = match self.hub_client.list_tree(&prefix, false).await {
             Ok(entries) => entries,
             Err(e) => {
                 error!("Failed to list tree for prefix '{}': {}", prefix, e);
@@ -562,7 +565,7 @@ impl VirtualFs {
                 let mtime = entry
                     .mtime
                     .as_deref()
-                    .map(HubApiClient::mtime_from_str)
+                    .map(crate::hub_api::mtime_from_str)
                     .unwrap_or_else(|| self.hub_client.default_mtime());
 
                 let ino = inodes.insert(
@@ -591,7 +594,7 @@ impl VirtualFs {
     /// Preload the entire tree in a single recursive API call.
     /// For repos this avoids N per-directory API calls during traversal.
     async fn preload_tree_recursive(&self) -> VirtualFsResult<()> {
-        let entries = match self.hub_client.list_tree_recursive().await {
+        let entries = match self.hub_client.list_tree("", true).await {
             Ok(entries) => entries,
             Err(e) => {
                 error!("Failed to preload recursive tree: {}", e);
@@ -622,7 +625,7 @@ impl VirtualFs {
                     let mtime = entry
                         .mtime
                         .as_deref()
-                        .map(HubApiClient::mtime_from_str)
+                        .map(crate::hub_api::mtime_from_str)
                         .unwrap_or_else(|| self.hub_client.default_mtime());
 
                     let ino = inodes.insert(
@@ -1272,7 +1275,7 @@ impl VirtualFs {
                 // Start a new stream if this is the first sequential read from offset 0
                 if matches!(plan.strategy, crate::prefetch::FetchStrategy::StartStream) {
                     let xet_file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
-                    match self.xet_sessions.download_stream(&xet_file_info) {
+                    match self.xet_sessions.download_stream_boxed(&xet_file_info) {
                         Ok(stream) => {
                             debug!("prefetch: started full-file stream");
                             prefetch_state.stream = Some(stream);
@@ -1330,8 +1333,6 @@ impl VirtualFs {
                 } else {
                     let fetch_end = offset + plan.fetch_size;
                     let file_info = XetFileInfo::new(prefetch_state.xet_hash.clone(), prefetch_state.file_size);
-                    let buf = Arc::new(Mutex::new(Vec::with_capacity(plan.fetch_size as usize)));
-                    let writer = SharedBufWriter(buf.clone());
 
                     debug!(
                         "prefetch fetch: offset={}, size={}, window={}",
@@ -1340,14 +1341,10 @@ impl VirtualFs {
 
                     match self
                         .xet_sessions
-                        .download_to_writer(&file_info, offset..fetch_end, writer)
+                        .download_range_to_vec(&file_info, offset..fetch_end)
                         .await
                     {
-                        Ok(_) => {
-                            let vec = match Arc::try_unwrap(buf) {
-                                Ok(mutex) => mutex.into_inner().unwrap_or_default(),
-                                Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-                            };
+                        Ok(vec) => {
                             let len = vec.len();
                             let chunk = Bytes::from(vec);
                             (VecDeque::from([chunk]), len)
@@ -2376,6 +2373,7 @@ impl VirtualFs {
 pub type VirtualFsError = i32;
 pub type VirtualFsResult<T> = std::result::Result<T, VirtualFsError>;
 
+#[derive(Debug)]
 pub struct VirtualFsAttr {
     pub ino: u64,
     pub size: u64,
@@ -2388,6 +2386,7 @@ pub struct VirtualFsAttr {
     pub gid: u32,
 }
 
+#[derive(Debug)]
 pub struct VirtualFsDirEntry {
     pub ino: u64,
     pub kind: InodeKind,
@@ -2514,7 +2513,7 @@ fn same_process(pid_a: u32, pid_b: u32) -> bool {
 /// Background task: drains the write channel and feeds data into the CAS streaming writer.
 /// Runs until a Finish message is received or the channel is dropped.
 async fn streaming_worker(
-    mut writer: StreamingWriter,
+    mut writer: Box<dyn StreamingWriterOps>,
     mut rx: tokio::sync::mpsc::Receiver<WriteMsg>,
     error: Arc<std::sync::Mutex<Option<String>>>,
 ) {
@@ -2534,7 +2533,7 @@ async fn streaming_worker(
                 let result = if failed {
                     Err(crate::error::Error::Hub("streaming write failed".into()))
                 } else {
-                    writer.finish().await
+                    writer.finish_boxed().await
                 };
                 let _ = reply.send(result);
                 return;
@@ -2553,17 +2552,5 @@ enum ReadTarget {
     },
 }
 
-/// Wraps `Arc<Mutex<Vec<u8>>>` to implement `Write + Send + 'static`
-/// for use with `FileDownloadSession::download_to_writer`.
-struct SharedBufWriter(Arc<Mutex<Vec<u8>>>);
-
-impl Write for SharedBufWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
+#[cfg(test)]
+mod tests;

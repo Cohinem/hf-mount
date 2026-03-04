@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 
 use bytes::{Bytes, BytesMut};
-use data::DownloadStream;
 use tracing::debug;
+
+use crate::xet::DownloadStreamOps;
 
 // ── Constants ──────────────────────────────────────────────────────────
 // TODO: expose these as CLI args / config to allow runtime tuning without recompilation.
@@ -66,7 +67,7 @@ pub(crate) struct PrefetchState {
     // Adaptive window size
     pub(crate) window_size: u64,
     // Full-file stream for sequential reads (reuses one FileReconstructor)
-    pub(crate) stream: Option<DownloadStream>,
+    pub(crate) stream: Option<Box<dyn DownloadStreamOps>>,
 }
 
 impl PrefetchState {
