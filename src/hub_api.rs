@@ -444,7 +444,7 @@ impl HubApiClient {
             .get("x-linked-etag")
             .or_else(|| headers.get("etag"))
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(|s| s.trim_matches('"').to_string());
         let last_modified = headers
             .get("last-modified")
             .and_then(|v| v.to_str().ok())
@@ -615,7 +615,7 @@ impl HubApiClient {
             .headers()
             .get("etag")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
+            .map(|s| s.trim_matches('"').to_string());
 
         // Stream response body to a temp file, then atomic-rename to dest.
         if let Some(parent) = dest.parent() {
