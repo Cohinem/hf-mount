@@ -235,11 +235,9 @@ impl HubApiClient {
             .as_str()
             .ok_or_else(|| Error::Hub("repo info missing 'id' field".to_string()))?;
 
-        if resolved_id.eq_ignore_ascii_case(&repo_id) {
-            return Ok(None);
+        if resolved_id != repo_id {
+            info!("Resolved repo alias: {} → {}", repo_id, resolved_id);
         }
-
-        info!("Resolved repo alias: {} → {}", repo_id, resolved_id);
         let new_source = SourceKind::Repo {
             repo_id: resolved_id.to_string(),
             repo_type,
@@ -258,22 +256,6 @@ impl HubApiClient {
             token: token.to_string(),
             source: SourceKind::Bucket {
                 bucket_id: bucket_id.to_string(),
-            },
-        })
-    }
-
-    /// Create a client for a HuggingFace repo (model/dataset/space).
-    pub fn new_repo(endpoint: &str, token: &str, repo_id: &str, repo_type: RepoType, revision: &str) -> Arc<Self> {
-        let (client, head_client) = make_clients();
-        Arc::new(Self {
-            client,
-            head_client,
-            endpoint: endpoint.trim_end_matches('/').to_string(),
-            token: token.to_string(),
-            source: SourceKind::Repo {
-                repo_id: repo_id.to_string(),
-                repo_type,
-                revision: revision.to_string(),
             },
         })
     }
@@ -640,6 +622,8 @@ impl HubApiClient {
             tokio::fs::rename(&tmp, dest).await?;
             if let Some(etag) = &new_etag {
                 tokio::fs::write(&etag_path, etag).await.ok();
+            } else {
+                tokio::fs::remove_file(&etag_path).await.ok();
             }
             Ok(())
         }
