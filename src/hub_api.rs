@@ -572,18 +572,24 @@ impl HubApiClient {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        let mut stream = resp.bytes_stream();
-        use futures::StreamExt;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            file.write_all(&chunk).await?;
+        let result: std::result::Result<(), Error> = async {
+            let mut file = tokio::fs::File::create(&tmp).await?;
+            let mut stream = resp.bytes_stream();
+            use futures::StreamExt;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                file.write_all(&chunk).await?;
+            }
+            file.shutdown().await?;
+            drop(file);
+            tokio::fs::rename(&tmp, dest).await?;
+            Ok(())
         }
-        file.flush().await?;
-        drop(file);
-        tokio::fs::rename(&tmp, dest).await?;
-
-        Ok(())
+        .await;
+        if result.is_err() {
+            tokio::fs::remove_file(&tmp).await.ok();
+        }
+        result
     }
 
     /// Create a token refresher for this source.
