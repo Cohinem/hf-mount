@@ -335,11 +335,13 @@ pub async fn mount_nfs(
 
     info!("NFS mount active at {}", mount_point_str);
 
-    // Wait for unmount signal or server exit.
+    // Wait for unmount signal, server exit, or Ctrl+C.
     // nfsserve sends `true` on MNT and `false` on UMNT — ignore mount events.
     // handle_forever() is an infinite accept() loop that never returns on its own.
     // On Linux, `umount` doesn't always send the UMNT RPC, so we also poll
     // /proc/mounts as a fallback to detect when the mount disappears.
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("Failed to register SIGTERM");
     tokio::pin!(server_handle);
     loop {
         tokio::select! {
@@ -354,6 +356,16 @@ pub async fn mount_nfs(
             }
             _ = &mut server_handle => {
                 info!("NFS server exited");
+                break;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received Ctrl+C, unmounting...");
+                unmount_nfs(mount_point_str);
+                break;
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, unmounting...");
+                unmount_nfs(mount_point_str);
                 break;
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
@@ -456,6 +468,40 @@ fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
 }
 
 /// Check if a path is still an active mount point.
+fn unmount_nfs(mount_point: &str) {
+    use std::ffi::CString;
+
+    // Try libc unmount first (no external process dependency).
+    if let Ok(c_path) = CString::new(mount_point) {
+        #[cfg(target_os = "linux")]
+        {
+            if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
+                return;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
+                return;
+            }
+        }
+    }
+
+    // Fallback: external command.
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("umount").arg(mount_point).status();
+    #[cfg(target_os = "linux")]
+    {
+        let _ = if unsafe { libc::getuid() } == 0 {
+            std::process::Command::new("umount").arg(mount_point).status()
+        } else {
+            std::process::Command::new("sudo")
+                .args(["-n", "umount", mount_point])
+                .status()
+        };
+    }
+}
+
 fn is_mounted(path: &str) -> bool {
     #[cfg(target_os = "linux")]
     {

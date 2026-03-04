@@ -8,7 +8,7 @@ use fuser::{
     OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
     Request, TimeOrNow,
 };
-use tracing::error;
+use tracing::{error, info};
 
 use crate::inode::InodeKind;
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
@@ -431,5 +431,74 @@ pub fn mount_fuse(
             std::process::exit(1);
         }
     };
+
+    // Catch SIGINT/SIGTERM and trigger a clean unmount instead of letting
+    // the default handler kill the process (which leaves a stale mount).
+    let mp = mount_point.to_path_buf();
+    runtime.spawn(async move {
+        wait_for_signal().await;
+        info!("Received signal, unmounting...");
+        unmount_fuse(&mp);
+    });
+
     let _ = bg.join();
+}
+
+/// Wait for SIGINT or SIGTERM.
+async fn wait_for_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+/// Trigger FUSE unmount. Uses libc as primary method (no external process
+/// dependency), then falls back to fusermount/umount. If all fail, force-exits
+/// to avoid hanging (tokio's signal handler replaces the default one, so
+/// bg.join() would block forever if unmount fails).
+fn unmount_fuse(mount_point: &Path) {
+    use std::ffi::CString;
+
+    let c_path = CString::new(mount_point.to_string_lossy().as_bytes()).ok();
+
+    // Try libc unmount first (like mountpoint-s3).
+    if let Some(ref c_path) = c_path {
+        #[cfg(target_os = "linux")]
+        {
+            // MNT_DETACH: lazy unmount, detaches immediately.
+            if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
+                return;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // MNT_FORCE: force unmount even with open files.
+            if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
+                return;
+            }
+        }
+    }
+
+    // Fallback: external command. Try fusermount3 first (FUSE3), then fusermount.
+    #[cfg(target_os = "linux")]
+    let cmd_ok = std::process::Command::new("fusermount3")
+        .args(["-u", "-z", &mount_point.to_string_lossy()])
+        .status()
+        .is_ok_and(|s| s.success())
+        || std::process::Command::new("fusermount")
+            .args(["-u", "-z", &mount_point.to_string_lossy()])
+            .status()
+            .is_ok_and(|s| s.success());
+    #[cfg(target_os = "macos")]
+    let cmd_ok = std::process::Command::new("umount")
+        .arg(mount_point)
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if !cmd_ok {
+        error!("Failed to unmount {:?}, forcing exit", mount_point);
+        std::process::exit(1);
+    }
 }
