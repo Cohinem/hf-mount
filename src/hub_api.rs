@@ -117,6 +117,9 @@ pub struct TreeEntry {
     pub entry_type: String,
     pub size: Option<u64>,
     pub xet_hash: Option<String>,
+    /// Git blob OID (same value as ETag on resolve endpoint).
+    #[serde(default)]
+    pub oid: Option<String>,
     pub mtime: Option<String>,
 }
 
@@ -128,6 +131,8 @@ struct RepoTreeEntry {
     #[serde(rename = "type")]
     entry_type: String,
     size: Option<u64>,
+    #[serde(default)]
+    oid: Option<String>,
     #[serde(default)]
     xet_hash: Option<String>,
     #[serde(default)]
@@ -378,6 +383,7 @@ impl HubApiClient {
                     entry_type: raw.entry_type,
                     size,
                     xet_hash: raw.xet_hash,
+                    oid: raw.oid,
                     // Repos don't expose per-file mtime in the tree listing
                     mtime: None,
                 });

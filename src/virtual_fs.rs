@@ -211,13 +211,14 @@ impl VirtualFs {
             struct Update {
                 ino: u64,
                 hash: Option<String>,
+                etag: Option<String>,
                 size: u64,
                 mtime: SystemTime,
             }
             let mut updates = Vec::new();
             let mut deletions = Vec::new();
 
-            for (ino, path, local_hash, local_size, is_dirty) in &snapshot {
+            for (ino, path, local_hash, local_etag, local_size, is_dirty) in &snapshot {
                 // Skip locally-modified files: local writes take precedence until flushed.
                 if *is_dirty {
                     continue;
@@ -225,11 +226,16 @@ impl VirtualFs {
                 match remote_map.get(path.as_str()) {
                     Some(remote) => {
                         let remote_hash = remote.xet_hash.as_deref();
+                        let remote_oid = remote.oid.as_deref();
                         let remote_size = remote.size.unwrap_or(0);
-                        let hash_changed = remote_hash != local_hash.as_deref();
-                        let size_changed = remote_size != *local_size;
+                        // Detect changes via xet_hash (preferred) or oid (= etag).
+                        let changed = if local_hash.is_some() || remote_hash.is_some() {
+                            remote_hash != local_hash.as_deref()
+                        } else {
+                            remote_oid != local_etag.as_deref()
+                        };
 
-                        if hash_changed || size_changed {
+                        if changed || remote_size != *local_size {
                             let mtime = remote
                                 .mtime
                                 .as_deref()
@@ -238,6 +244,7 @@ impl VirtualFs {
                             updates.push(Update {
                                 ino: *ino,
                                 hash: remote_hash.map(|s| s.to_string()),
+                                etag: remote_oid.map(|s| s.to_string()),
                                 size: remote_size,
                                 mtime,
                             });
@@ -258,7 +265,13 @@ impl VirtualFs {
                 let mut inode_table = inodes.write().expect("inodes poisoned");
 
                 for update in &updates {
-                    inode_table.update_remote_file(update.ino, update.hash.clone(), None, update.size, update.mtime);
+                    inode_table.update_remote_file(
+                        update.ino,
+                        update.hash.clone(),
+                        update.etag.clone(),
+                        update.size,
+                        update.mtime,
+                    );
                     inos_to_invalidate.push(update.ino);
                 }
 
@@ -538,7 +551,7 @@ impl VirtualFs {
                     .map(HubApiClient::mtime_from_str)
                     .unwrap_or(UNIX_EPOCH);
 
-                inodes.insert(
+                let ino = inodes.insert(
                     parent_ino,
                     rel_path.to_string(),
                     entry.path,
@@ -547,6 +560,11 @@ impl VirtualFs {
                     mtime,
                     entry.xet_hash,
                 );
+                if let Some(oid) = entry.oid
+                    && let Some(e) = inodes.get_mut(ino)
+                {
+                    e.etag = Some(oid);
+                }
             }
         }
 
