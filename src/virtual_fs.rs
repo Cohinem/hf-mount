@@ -198,7 +198,7 @@ impl VirtualFs {
         loop {
             tokio::time::sleep(interval).await;
 
-            let remote_entries = match hub_client.list_tree("").await {
+            let remote_entries = match hub_client.list_tree_recursive().await {
                 Ok(entries) => entries,
                 Err(e) => {
                     warn!("Remote poll failed: {}", e);
