@@ -1894,7 +1894,7 @@ impl VirtualFs {
             "Committed file: {} (hash={}, size={})",
             full_path,
             file_info.hash(),
-            file_info.file_size()
+            file_info.file_size(),
         );
 
         Ok(())
