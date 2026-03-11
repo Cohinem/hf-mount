@@ -63,9 +63,10 @@ pub struct VirtualFs {
     /// Per-inode pending commit receivers. release() publishes the commit result here;
     /// open() awaits it instead of blindly blocking on staging_lock.
     pending_commits: Mutex<HashMap<u64, CommitHookRx>>,
-    /// Debounced batch flush pipeline (None when read_only).
+    /// Batched flush pipeline: dirty file writes + remote delete queue.
+    /// Only present in advanced_writes mode.
     flush_manager: Option<flush::FlushManager>,
-    /// Background poll task handle, taken in shutdown().
+    /// Background poll task handle, aborted in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
     /// The poll loop calls this to actively invalidate stale inodes when remote changes
@@ -202,11 +203,11 @@ impl VirtualFs {
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
     pub fn shutdown(&self) {
         info!("Shutting down VFS, flushing pending writes...");
-        // Abort the polling task.
+        // Abort background tasks.
         if let Some(handle) = self.poll_handle.lock().expect("poll_handle poisoned").take() {
             handle.abort();
         }
-        // Flush all dirty files that may not have received a release() yet.
+        // Flush all dirty files + queued deletes.
         if let Some(fm) = &self.flush_manager {
             let dirty = self.inode_table.read().expect("inodes poisoned").dirty_inos();
             fm.shutdown(dirty, &self.runtime);
@@ -1577,10 +1578,11 @@ impl VirtualFs {
                     let written = n as u32;
                     let new_end = offset + written as u64;
                     let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                    if let Some(entry) = inodes.get_mut(handle_ino)
-                        && new_end > entry.size
-                    {
-                        entry.size = new_end;
+                    if let Some(entry) = inodes.get_mut(handle_ino) {
+                        if new_end > entry.size {
+                            entry.size = new_end;
+                        }
+                        entry.dirty = true;
                     }
                     Ok(written)
                 }
@@ -1975,6 +1977,9 @@ impl VirtualFs {
         };
 
         self.negative_cache_remove(&full_path);
+        if let Some(fm) = &self.flush_manager {
+            fm.cancel_delete(&full_path);
+        }
 
         if self.advanced_writes {
             // Advanced mode: staging file on disk + async flush
@@ -2121,18 +2126,21 @@ impl VirtualFs {
             (entry.inode, entry.full_path.clone(), needs_remote)
         };
 
-        // Delete from remote first — if this fails, local state is untouched and
-        // the caller gets EIO with a consistent filesystem.
-        if needs_remote_delete
-            && let Err(e) = self
+        // Advanced writes: queue delete for batched flush in the flush_loop.
+        // Simple mode: delete synchronously (one HTTP call per unlink).
+        if needs_remote_delete {
+            if let Some(fm) = &self.flush_manager {
+                fm.enqueue_delete(full_path.clone());
+            } else if let Err(e) = self
                 .hub_client
                 .batch_operations(&[BatchOp::DeleteFile {
                     path: full_path.clone(),
                 }])
                 .await
-        {
-            error!("Remote delete failed for {}: {}", full_path, e);
-            return Err(libc::EIO);
+            {
+                error!("Remote delete failed for {}: {}", full_path, e);
+                return Err(libc::EIO);
+            }
         }
 
         // Remote succeeded (or no remote needed) — now unlink locally.
@@ -2242,6 +2250,12 @@ impl VirtualFs {
         }
 
         debug!("rmdir: parent={}, name={}", parent, name);
+
+        // Flush any queued remote deletes (e.g. from rm -rf that unlinked
+        // files before calling rmdir on the now-empty directory).
+        if let Some(fm) = &self.flush_manager {
+            fm.flush_deletes().await;
+        }
 
         self.ensure_children_loaded(parent).await?;
 
@@ -2495,6 +2509,14 @@ impl VirtualFs {
         no_replace: bool,
     ) -> VirtualFsResult<()> {
         self.negative_cache_remove(&info.new_full_path);
+        // Cancel any queued remote delete for the destination path (e.g. rm a && mv b a).
+        // For directories, also cancel descendant deletes (e.g. rm -rf dir && mv newdir dir).
+        if let Some(fm) = &self.flush_manager {
+            fm.cancel_delete(&info.new_full_path);
+            if info.kind == InodeKind::Directory {
+                fm.cancel_delete_prefix(&format!("{}/", info.new_full_path));
+            }
+        }
 
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
 

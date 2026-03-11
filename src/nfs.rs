@@ -256,6 +256,8 @@ impl NFSFileSystem for NFSAdapter {
             set_gid3::Void => self.virtual_fs.default_gid(),
         };
         let (ino, fattr) = self.create_file(dirid, filename, mode, uid, gid).await?;
+        // Schedule a flush so empty files (e.g. `touch`) get committed to remote.
+        self.virtual_fs.schedule_flush(ino);
         Ok((ino, fattr))
     }
 
