@@ -46,7 +46,11 @@ pub struct InodeEntry {
     pub xet_hash: Option<String>,
     /// ETag from the last HEAD revalidation (used for non-xet plain git/LFS files).
     pub etag: Option<String>,
-    pub dirty: bool,
+    /// Dirty generation counter. 0 = clean. Each mutation increments the counter.
+    /// `flush_batch` snapshots the generation before upload; after commit it only
+    /// clears dirty (resets to 0) if the generation hasn't advanced, preventing
+    /// concurrent writers from silently losing their data.
+    pub dirty_generation: u64,
     pub children_loaded: bool,
     pub children: Vec<DirChild>,
     /// Old remote paths that should be deleted on next flush (set by rename of dirty files).
@@ -54,6 +58,43 @@ pub struct InodeEntry {
     /// When this inode's metadata was last validated against the remote (via HEAD).
     /// Used to avoid redundant HEAD requests within the revalidation TTL.
     pub last_revalidated: Option<Instant>,
+}
+
+impl InodeEntry {
+    /// Returns true if this inode has uncommitted changes.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty_generation > 0
+    }
+
+    /// Mark the inode as dirty, incrementing the generation counter.
+    pub fn set_dirty(&mut self) {
+        self.dirty_generation = self.dirty_generation.saturating_add(1);
+    }
+
+    /// Clear the dirty flag, but only if the generation matches the snapshot
+    /// taken before the flush. Returns true if cleared, false if a concurrent
+    /// writer advanced the generation (meaning the inode is still dirty).
+    pub fn clear_dirty_if(&mut self, snapshot_generation: u64) -> bool {
+        if self.dirty_generation == snapshot_generation {
+            self.dirty_generation = 0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply a successful commit: update hash, size, timestamps, and
+    /// conditionally clear dirty + pending_deletes if the generation matches.
+    pub fn apply_commit(&mut self, hash: &str, size: u64, dirty_generation: u64) {
+        self.xet_hash = Some(hash.to_string());
+        self.size = size;
+        if self.clear_dirty_if(dirty_generation) {
+            self.pending_deletes.clear();
+        }
+        let now = SystemTime::now();
+        self.mtime = now;
+        self.ctime = now;
+    }
 }
 
 pub struct InodeTable {
@@ -94,7 +135,7 @@ impl InodeTable {
             symlink_target: None,
             xet_hash: None,
             etag: None,
-            dirty: false,
+            dirty_generation: 0,
             children_loaded: false,
             children: Vec::new(),
             pending_deletes: Vec::new(),
@@ -193,7 +234,7 @@ impl InodeTable {
             symlink_target: None,
             xet_hash,
             etag: None,
-            dirty: false,
+            dirty_generation: 0,
             children_loaded: kind != InodeKind::Directory, // only dirs have children to load
             children: Vec::new(),
             pending_deletes: Vec::new(),
@@ -232,12 +273,12 @@ impl InodeTable {
     pub fn dirty_inos(&self) -> Vec<u64> {
         self.inodes
             .values()
-            .filter(|e| e.kind == InodeKind::File && e.dirty && e.nlink > 0)
+            .filter(|e| e.kind == InodeKind::File && e.is_dirty() && e.nlink > 0)
             .map(|e| e.inode)
             .collect()
     }
 
-    /// Snapshot of all file entries: (ino, full_path, xet_hash, etag, size, dirty)
+    /// Snapshot of all file entries: (ino, full_path, xet_hash, etag, size, is_dirty)
     #[allow(clippy::type_complexity)]
     pub fn file_snapshot(&self) -> Vec<(u64, String, Option<String>, Option<String>, u64, bool)> {
         self.inodes
@@ -250,7 +291,7 @@ impl InodeTable {
                     e.xet_hash.clone(),
                     e.etag.clone(),
                     e.size,
-                    e.dirty,
+                    e.is_dirty(),
                 )
             })
             .collect()
@@ -266,7 +307,7 @@ impl InodeTable {
         new_mtime: SystemTime,
     ) -> bool {
         if let Some(entry) = self.inodes.get_mut(&ino) {
-            if entry.dirty {
+            if entry.is_dirty() {
                 return false;
             }
             entry.xet_hash = new_hash;
@@ -434,8 +475,12 @@ impl InodeTable {
     /// Remove an orphan inode (nlink == 0, no remaining file handles).
     /// Called from release() after the last open handle is closed.
     pub fn remove_orphan(&mut self, ino: u64) {
-        if self.inodes.get(&ino).is_some_and(|e| e.nlink == 0) {
+        if let Some(entry) = self.inodes.get(&ino)
+            && entry.nlink == 0
+        {
+            let path = entry.full_path.clone();
             self.inodes.remove(&ino);
+            self.path_to_inode.remove(&path);
         }
     }
 }
@@ -499,15 +544,104 @@ mod tests {
         );
 
         // Newly inserted inodes are not dirty
-        assert!(!table.get(ino).unwrap().dirty);
+        assert!(!table.get(ino).unwrap().is_dirty());
 
-        // Set dirty
-        table.get_mut(ino).unwrap().dirty = true;
-        assert!(table.get(ino).unwrap().dirty);
+        // Set dirty (advances generation)
+        table.get_mut(ino).unwrap().set_dirty();
+        assert!(table.get(ino).unwrap().is_dirty());
+        let dirty_gen = table.get(ino).unwrap().dirty_generation;
+        assert_eq!(dirty_gen, 1);
 
-        // Clear dirty
-        table.get_mut(ino).unwrap().dirty = false;
-        assert!(!table.get(ino).unwrap().dirty);
+        // Clear dirty with matching generation
+        assert!(table.get_mut(ino).unwrap().clear_dirty_if(dirty_gen));
+        assert!(!table.get(ino).unwrap().is_dirty());
+
+        // Set dirty twice, clear with stale generation fails
+        table.get_mut(ino).unwrap().set_dirty(); // gen=1
+        table.get_mut(ino).unwrap().set_dirty(); // gen=2
+        assert_eq!(table.get(ino).unwrap().dirty_generation, 2);
+        assert!(!table.get_mut(ino).unwrap().clear_dirty_if(1)); // stale snapshot
+        assert!(table.get(ino).unwrap().is_dirty()); // still dirty
+    }
+
+    #[test]
+    fn apply_commit_clears_dirty_and_updates_metadata() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            100,
+            UNIX_EPOCH,
+            Some("old_hash".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty();
+        entry.pending_deletes.push("old_path".to_string());
+        let snap = entry.dirty_generation;
+
+        entry.apply_commit("new_hash", 200, snap);
+
+        assert!(!entry.is_dirty());
+        assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
+        assert_eq!(entry.size, 200);
+        assert!(entry.pending_deletes.is_empty());
+        assert!(entry.mtime > UNIX_EPOCH);
+    }
+
+    #[test]
+    fn apply_commit_keeps_dirty_on_generation_mismatch() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            100,
+            UNIX_EPOCH,
+            Some("old_hash".to_string()),
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.set_dirty(); // gen=1
+        entry.pending_deletes.push("old_path".to_string());
+        entry.set_dirty(); // gen=2 (simulates concurrent writer)
+
+        entry.apply_commit("new_hash", 200, 1); // stale snapshot
+
+        // Hash and size updated, but dirty NOT cleared and pending_deletes preserved
+        assert!(entry.is_dirty());
+        assert_eq!(entry.xet_hash.as_deref(), Some("new_hash"));
+        assert_eq!(entry.size, 200);
+        assert_eq!(entry.pending_deletes.len(), 1);
+    }
+
+    #[test]
+    fn set_dirty_saturates() {
+        let mut table = InodeTable::new();
+        let ino = table.insert(
+            ROOT_INODE,
+            "test".to_string(),
+            "test".to_string(),
+            InodeKind::File,
+            0,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        let entry = table.get_mut(ino).unwrap();
+        entry.dirty_generation = u64::MAX;
+        entry.set_dirty();
+        assert_eq!(entry.dirty_generation, u64::MAX); // saturated, not wrapped to 0
+        assert!(entry.is_dirty());
     }
 
     #[test]
@@ -767,7 +901,7 @@ mod tests {
             0,
             0,
         );
-        table.get_mut(ino1).unwrap().dirty = true;
+        table.get_mut(ino1).unwrap().set_dirty();
 
         let ino2 = table.insert(
             ROOT_INODE,
@@ -838,7 +972,7 @@ mod tests {
         assert_eq!(entry.mtime, new_mtime);
 
         // Mark dirty — update should fail
-        table.get_mut(ino).unwrap().dirty = true;
+        table.get_mut(ino).unwrap().set_dirty();
         assert!(!table.update_remote_file(ino, Some("ignored".to_string()), None, 999, UNIX_EPOCH));
         assert_eq!(table.get(ino).unwrap().size, 200, "dirty file should not be updated");
 
@@ -1061,8 +1195,8 @@ mod tests {
             0,
             0,
         );
-        table.get_mut(file_ino).unwrap().dirty = true;
-        table.get_mut(dir_ino).unwrap().dirty = true;
+        table.get_mut(file_ino).unwrap().set_dirty();
+        table.get_mut(dir_ino).unwrap().set_dirty();
 
         let dirty = table.dirty_inos();
         assert_eq!(dirty, vec![file_ino]);
@@ -1369,8 +1503,10 @@ mod tests {
         let entry = table.get(file_ino).unwrap();
         assert_eq!(entry.nlink, 0);
 
-        // remove_orphan should clean it up
+        // remove_orphan should clean up both inodes map and path_to_inode
+        let path = entry.full_path.clone();
         table.remove_orphan(file_ino);
         assert!(table.get(file_ino).is_none());
+        assert!(table.get_by_path(&path).is_none(), "path_to_inode should be cleaned up");
     }
 }

@@ -97,7 +97,7 @@ fn streaming_write_happy_path() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(!entry.dirty);
+        assert!(!entry.is_dirty());
         assert!(entry.xet_hash.is_some());
     });
 
@@ -205,7 +205,7 @@ fn hub_commit_fail_retry_in_release() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(!entry.dirty);
+        assert!(!entry.is_dirty());
         assert!(entry.xet_hash.is_some());
     });
 }
@@ -257,7 +257,7 @@ fn revert_inode_overwrite_restored() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(!entry.dirty);
+        assert!(!entry.is_dirty());
         assert_eq!(entry.xet_hash.as_deref(), Some("original_hash"));
         assert_eq!(entry.size, 100);
     });
@@ -338,7 +338,7 @@ fn release_commits_without_flush() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(!entry.dirty);
+        assert!(!entry.is_dirty());
     });
 }
 
@@ -811,7 +811,7 @@ fn poll_dirty_files_skipped() {
 
         {
             let mut inodes = vfs.inode_table.write().unwrap();
-            inodes.get_mut(ino).unwrap().dirty = true;
+            inodes.get_mut(ino).unwrap().set_dirty();
         }
 
         let mut inodes = vfs.inode_table.write().unwrap();
@@ -1022,7 +1022,7 @@ fn setattr_advanced_truncate_zero() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(entry.dirty);
+        assert!(entry.is_dirty());
         assert!(entry.xet_hash.is_none());
     });
 }
@@ -1212,7 +1212,7 @@ fn create_and_write_advanced_mode() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(entry.dirty);
+        assert!(entry.is_dirty());
     });
 }
 
@@ -1578,7 +1578,7 @@ fn open_advanced_write_truncate() {
         {
             let inodes = vfs.inode_table.read().unwrap();
             assert_eq!(inodes.get(ino).unwrap().size, 0);
-            assert!(inodes.get(ino).unwrap().dirty);
+            assert!(inodes.get(ino).unwrap().is_dirty());
         }
         vfs.release(fh).await.unwrap();
     });
@@ -1629,7 +1629,7 @@ fn setattr_truncate_nonzero() {
 
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(ino).unwrap();
-        assert!(entry.dirty);
+        assert!(entry.is_dirty());
     });
 }
 
@@ -2016,7 +2016,7 @@ fn revalidation_skips_dirty_files() {
         let attr2 = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
         let inodes = vfs.inode_table.read().unwrap();
         let entry = inodes.get(attr2.ino).unwrap();
-        assert!(entry.dirty);
+        assert!(entry.is_dirty());
         // Hash and size must remain unchanged (not overwritten by remote)
         assert_eq!(entry.xet_hash.as_deref(), Some("hash1"));
         assert_ne!(entry.size, 500, "dirty file size should not be updated from remote");
@@ -2326,5 +2326,208 @@ fn stream_calls_record_bounded_end_for_seek_reads() {
         );
 
         vfs.release(fh).await.unwrap();
+    });
+}
+
+/// fsync on a streaming handle is a no-op (doesn't tear down the writer).
+/// Writes after fsync must still succeed.
+#[test]
+fn fsync_streaming_noop() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (_, fh) = vfs.create(ROOT_INODE, "fsync_test", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+
+        // Write some data
+        write_blocking(&vfs, ino, fh, 0, b"hello").await.unwrap();
+
+        // fsync should succeed (no-op for streaming)
+        vfs.fsync(ino, fh, None).await.unwrap();
+
+        // Write more data after fsync -- must not fail
+        write_blocking(&vfs, ino, fh, 5, b" world").await.unwrap();
+
+        // flush + release commit the full data
+        vfs.flush(ino, fh, None).await.unwrap();
+        vfs.release(fh).await.unwrap();
+
+        let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+        assert!(!entry.is_dirty());
+        assert!(entry.xet_hash.is_some());
+    });
+}
+
+/// fsync on an advanced-writes handle triggers a synchronous flush to Hub.
+#[test]
+fn fsync_advanced_writes_commits() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (_, fh) = vfs.create(ROOT_INODE, "fsync_adv", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+
+        // Write data (goes to staging file)
+        write_blocking(&vfs, ino, fh, 0, b"advanced data").await.unwrap();
+
+        // Before fsync: inode is dirty
+        assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+
+        // fsync triggers synchronous flush
+        vfs.fsync(ino, fh, None).await.unwrap();
+
+        // After fsync: inode is clean, hash is set
+        let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+        assert!(!entry.is_dirty());
+        assert!(entry.xet_hash.is_some());
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// fsync on an empty file (0 bytes) goes through CAS upload + Hub commit
+/// like any other file. The inode should be clean after fsync.
+#[test]
+fn fsync_empty_file_commits() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (_, fh) = vfs.create(ROOT_INODE, "empty", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+
+        // No write — staging file stays empty (0 bytes)
+        assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+
+        vfs.fsync(ino, fh, None).await.unwrap();
+
+        // After fsync: inode is clean, hash is set (CAS returns a hash even for empty files)
+        let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+        assert!(!entry.is_dirty(), "empty file should be clean after fsync");
+        assert!(entry.xet_hash.is_some(), "empty file should have xet_hash from CAS");
+        assert_eq!(entry.size, 0);
+
+        // Hub should have received a batch commit
+        let logs = hub.take_batch_log();
+        assert!(!logs.is_empty(), "empty file should be committed to Hub");
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// Race test: a concurrent writer advances dirty_generation while fsync is
+/// mid-flight (between upload and Hub commit). The inode must stay dirty
+/// because the concurrent writer's data hasn't been flushed yet.
+#[test]
+fn dirty_generation_race_with_concurrent_writer() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (_, fh) = vfs.create(ROOT_INODE, "race", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+        write_blocking(&vfs, ino, fh, 0, b"writer A").await.unwrap();
+
+        // Set a barrier on batch_operations: fsync will pause after upload,
+        // before commit. We inject a concurrent write at that point.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        hub.set_batch_barrier(barrier.clone());
+
+        // Launch fsync in background — it will block at the barrier inside batch_operations
+        let vfs2 = vfs.clone();
+        let fsync_handle = tokio::spawn(async move { vfs2.fsync(ino, fh, None).await });
+
+        // Wait for fsync to reach the barrier (upload done, about to commit)
+        barrier.wait().await;
+
+        // Concurrent writer B advances the generation while fsync is mid-commit
+        vfs.inode_table.write().unwrap().get_mut(ino).unwrap().set_dirty();
+
+        // Clear barrier so future batch_operations don't block
+        hub.set_batch_barrier(std::sync::Arc::new(tokio::sync::Barrier::new(1)));
+
+        // fsync completes (batch_operations proceeds after barrier)
+        fsync_handle.await.unwrap().unwrap();
+
+        // Inode must STILL be dirty: writer B advanced the generation,
+        // so clear_dirty_if(snapshot) returned false.
+        let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+        assert!(
+            entry.is_dirty(),
+            "inode must stay dirty when concurrent writer advanced generation during flush"
+        );
+        // But the hash WAS updated (the upload+commit succeeded)
+        assert!(entry.xet_hash.is_some());
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// After fsync commits, a subsequent write re-dirties the inode.
+#[test]
+fn fsync_then_write_redirties() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_advanced(&hub, &xet);
+
+    rt.block_on(async {
+        let (_, fh) = vfs.create(ROOT_INODE, "redirty", 0o644, 0, 0, None).await.unwrap();
+        let ino = ROOT_INODE + 1;
+
+        // Write + fsync -> clean
+        write_blocking(&vfs, ino, fh, 0, b"initial").await.unwrap();
+        assert!(vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty());
+
+        vfs.fsync(ino, fh, None).await.unwrap();
+        assert!(
+            !vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty(),
+            "should be clean after fsync"
+        );
+
+        // Write again -> must re-dirty
+        let result = vfs.write(ino, fh, 0, b"more");
+        assert!(result.is_ok(), "write after fsync should succeed");
+        assert!(
+            vfs.inode_table.read().unwrap().get(ino).unwrap().is_dirty(),
+            "should be dirty again after write"
+        );
+
+        vfs.release(fh).await.unwrap();
+    });
+}
+
+/// If streaming writer creation fails on open(O_TRUNC), the inode must NOT
+/// be truncated. Before the fix, the inode was mutated before writer setup,
+/// leaving it stuck at size=0 with no handle to recover.
+#[test]
+fn failed_writer_create_preserves_inode() {
+    let hub = MockHub::new();
+    hub.add_file("existing.txt", 1000, Some("original_hash"), None);
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let attr = vfs.lookup(ROOT_INODE, "existing.txt").await.unwrap();
+        let ino = attr.ino;
+        assert_eq!(attr.size, 1000);
+
+        // Make the next streaming writer creation fail
+        xet.fail_next_writer_create();
+
+        // Open with O_TRUNC should fail (writer creation error -> EIO)
+        let result = vfs.open(ino, true, true, None).await;
+        assert_eq!(result.unwrap_err(), libc::EIO);
+
+        // Inode must be preserved: original hash, original size, NOT dirty
+        let entry = vfs.inode_table.read().unwrap().get(ino).unwrap().clone();
+        assert_eq!(entry.xet_hash.as_deref(), Some("original_hash"));
+        assert_eq!(entry.size, 1000);
+        assert!(!entry.is_dirty(), "inode should not be dirty after failed open");
     });
 }

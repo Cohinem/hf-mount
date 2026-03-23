@@ -55,23 +55,27 @@ impl NFSAdapter {
             .await
             .map_err(errno_to_nfs)?;
         // Insert into pool (evict LRU if full)
-        let (evicted, dup_handle) = {
+        let (result, dup_handle) = {
             let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
             // Double-check: another task may have opened it concurrently
             if let Some(existing) = pool.get(ino) {
                 (None, Some((existing, file_handle)))
             } else {
-                (pool.insert(ino, file_handle), None)
+                (Some(pool.insert(ino, file_handle)), None)
             }
         };
         // Release duplicate handle outside the lock (release is async).
-        // This is a freshly-opened read-only handle, so errors are non-critical.
         if let Some((existing, dup)) = dup_handle {
             let _ = self.virtual_fs.release(dup).await;
             return Ok(existing);
         }
-        if let Some((evicted_ino, evicted_handle)) = evicted {
-            self.evict_handle(evicted_ino, evicted_handle).await;
+        if let Some(result) = result {
+            if let Some((evicted_ino, evicted_handle)) = result.evicted {
+                self.evict_handle(evicted_ino, evicted_handle).await;
+            }
+            if let Some(replaced_handle) = result.replaced {
+                let _ = self.virtual_fs.release(replaced_handle).await;
+            }
         }
         Ok(file_handle)
     }
@@ -99,12 +103,15 @@ impl NFSAdapter {
 
     /// Insert a writable handle into the pool (used after create).
     async fn insert_handle(&self, ino: u64, file_handle: u64) {
-        let evicted = {
+        let result = {
             let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
             pool.insert(ino, file_handle)
         };
-        if let Some((evicted_ino, evicted_handle)) = evicted {
+        if let Some((evicted_ino, evicted_handle)) = result.evicted {
             self.evict_handle(evicted_ino, evicted_handle).await;
+        }
+        if let Some(replaced_handle) = result.replaced {
+            self.evict_handle(ino, replaced_handle).await;
         }
     }
 }
@@ -141,11 +148,23 @@ impl NFSFileSystem for NFSAdapter {
 
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
         let file_handle = self.get_or_open_handle(id).await?;
-        self.virtual_fs
-            .read(file_handle, offset, count)
-            .await
-            .map(|(b, eof)| (b.to_vec(), eof))
-            .map_err(errno_to_nfs)
+        match self.virtual_fs.read(file_handle, offset, count).await {
+            Ok((bytes, eof)) => Ok((bytes.to_vec(), eof)),
+            Err(libc::EBADF) => {
+                // Handle was evicted by a concurrent operation between
+                // get_or_open_handle and read. Purge stale pool entry and retry
+                // internally (returning STALE would be treated as a hard error
+                // by some NFS clients instead of a transparent retry).
+                self.handle_pool.lock().expect("handle_pool poisoned").remove(id);
+                let file_handle = self.get_or_open_handle(id).await?;
+                self.virtual_fs
+                    .read(file_handle, offset, count)
+                    .await
+                    .map(|(b, eof)| (b.to_vec(), eof))
+                    .map_err(errno_to_nfs)
+            }
+            Err(e) => Err(errno_to_nfs(e)),
+        }
     }
 
     async fn readdir(
@@ -292,9 +311,7 @@ impl NFSFileSystem for NFSAdapter {
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
         let name = nfs_name(filename)?;
-        // Check whether this is a file or directory.
-        let child_ino = self.virtual_fs.lookup(dirid, name).await.map_err(errno_to_nfs)?.ino;
-        let attr = self.virtual_fs.getattr(child_ino).map_err(errno_to_nfs)?;
+        let attr = self.virtual_fs.lookup(dirid, name).await.map_err(errno_to_nfs)?;
         match attr.kind {
             InodeKind::Directory => self.virtual_fs.rmdir(dirid, name).await.map_err(errno_to_nfs),
             _ => self.virtual_fs.unlink(dirid, name).await.map_err(errno_to_nfs),
@@ -362,6 +379,7 @@ pub async fn mount_nfs(
 ) -> std::io::Result<()> {
     let vfs_for_shutdown = virtual_fs.clone();
     let adapter = NFSAdapter::new(virtual_fs, read_only);
+    let pool_for_shutdown = adapter.handle_pool.clone();
     let mut listener = NFSTcpListener::bind("127.0.0.1:0", adapter).await?;
     let port = listener.get_listen_port();
     info!("NFS server listening on 127.0.0.1:{}", port);
@@ -478,6 +496,13 @@ pub async fn mount_nfs(
         }
     }
 
+    // Drain handle pool: flush and release all cached handles before VFS shutdown.
+    let entries = pool_for_shutdown.lock().expect("handle_pool poisoned").drain();
+    for (ino, file_handle) in entries {
+        let _ = vfs_for_shutdown.flush(ino, file_handle, None).await;
+        let _ = vfs_for_shutdown.release(file_handle).await;
+    }
+
     vfs_for_shutdown.shutdown();
     Ok(())
 }
@@ -499,6 +524,13 @@ pub async fn mount_nfs(
 
 const HANDLE_POOL_CAPACITY: usize = 64;
 
+struct InsertResult {
+    /// LRU eviction of a different ino (pool was full).
+    evicted: Option<(u64, u64)>,
+    /// Replaced handle for the same ino (e.g. read -> write upgrade).
+    replaced: Option<u64>,
+}
+
 struct HandlePool {
     handles: HashMap<u64, u64>, // ino -> file_handle
     order: VecDeque<u64>,       // ino access order (front = oldest)
@@ -514,7 +546,7 @@ impl HandlePool {
 
     fn get(&mut self, ino: u64) -> Option<u64> {
         if let Some(&file_handle) = self.handles.get(&ino) {
-            self.order.retain(|&i| i != ino);
+            self.order_remove(ino);
             self.order.push_back(ino);
             Some(file_handle)
         } else {
@@ -522,8 +554,34 @@ impl HandlePool {
         }
     }
 
-    /// Insert a handle, returning the evicted (ino, file_handle) if pool was full.
-    fn insert(&mut self, ino: u64, file_handle: u64) -> Option<(u64, u64)> {
+    /// Remove an entry from the pool (both handles map and order deque).
+    fn remove(&mut self, ino: u64) {
+        self.handles.remove(&ino);
+        self.order_remove(ino);
+    }
+
+    /// Drain all entries, returning (ino, file_handle) pairs.
+    fn drain(&mut self) -> Vec<(u64, u64)> {
+        self.order.clear();
+        self.handles.drain().collect()
+    }
+
+    fn order_remove(&mut self, ino: u64) {
+        if let Some(pos) = self.order.iter().position(|&i| i == ino) {
+            self.order.remove(pos);
+        }
+    }
+
+    /// Insert a handle. Returns evicted entries that the caller must release:
+    /// - `evicted`: LRU eviction if pool was full (different ino)
+    /// - `replaced`: old handle for the same ino (e.g. replacing read with write)
+    fn insert(&mut self, ino: u64, file_handle: u64) -> InsertResult {
+        let replaced = if self.handles.contains_key(&ino) {
+            self.order_remove(ino);
+            self.handles.remove(&ino)
+        } else {
+            None
+        };
         let evicted = if self.handles.len() >= HANDLE_POOL_CAPACITY {
             self.order
                 .pop_front()
@@ -533,7 +591,7 @@ impl HandlePool {
         };
         self.handles.insert(ino, file_handle);
         self.order.push_back(ino);
-        evicted
+        InsertResult { evicted, replaced }
     }
 }
 
@@ -563,7 +621,7 @@ fn errno_to_nfs(e: i32) -> nfsstat3 {
 fn system_time_to_nfstime(t: SystemTime) -> nfstime3 {
     let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
     nfstime3 {
-        seconds: d.as_secs() as u32,
+        seconds: d.as_secs().min(u32::MAX as u64) as u32,
         nseconds: d.subsec_nanos(),
     }
 }
@@ -590,16 +648,21 @@ fn unmount_nfs(mount_point: &str) {
 
     // Fallback: external command.
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("umount").arg(mount_point).status();
+    if let Err(e) = std::process::Command::new("umount").arg(mount_point).status() {
+        tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+    }
     #[cfg(target_os = "linux")]
     {
-        let _ = if unsafe { libc::getuid() } == 0 {
+        let result = if unsafe { libc::getuid() } == 0 {
             std::process::Command::new("umount").arg(mount_point).status()
         } else {
             std::process::Command::new("sudo")
                 .args(["-n", "umount", mount_point])
                 .status()
         };
+        if let Err(e) = result {
+            tracing::warn!("NFS unmount fallback failed for {}: {}", mount_point, e);
+        }
     }
 }
 
@@ -661,4 +724,125 @@ fn vfs_attr_to_nfs(attr: &VirtualFsAttr) -> fattr3 {
 fn nfstime_to_system_time(t: nfstime3) -> SystemTime {
     let nsec = t.nseconds.min(999_999_999);
     UNIX_EPOCH + std::time::Duration::new(t.seconds as u64, nsec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_pool_basic() {
+        let mut pool = HandlePool::new();
+        assert!(pool.get(1).is_none());
+
+        let result = pool.insert(1, 100);
+        assert!(result.evicted.is_none());
+        assert!(result.replaced.is_none());
+        assert_eq!(pool.get(1), Some(100));
+    }
+
+    #[test]
+    fn handle_pool_lru_eviction() {
+        let mut pool = HandlePool::new();
+        // Fill pool to capacity
+        for i in 0..HANDLE_POOL_CAPACITY as u64 {
+            pool.insert(i, i + 1000);
+        }
+        // All entries present
+        assert_eq!(pool.get(0), Some(1000));
+        assert_eq!(
+            pool.get(HANDLE_POOL_CAPACITY as u64 - 1),
+            Some(1000 + HANDLE_POOL_CAPACITY as u64 - 1)
+        );
+
+        // Insert one more -> evicts LRU. ino=0 was accessed last (by get above),
+        // so ino=1 (oldest untouched) should be evicted.
+        let result = pool.insert(999, 9999);
+        assert!(result.evicted.is_some());
+        let (evicted_ino, evicted_fh) = result.evicted.unwrap();
+        assert_eq!(evicted_ino, 1);
+        assert_eq!(evicted_fh, 1001);
+        assert!(result.replaced.is_none());
+
+        // ino=1 is gone
+        assert!(pool.get(1).is_none());
+        // ino=999 is present
+        assert_eq!(pool.get(999), Some(9999));
+    }
+
+    #[test]
+    fn handle_pool_no_duplicate_on_reinsert() {
+        let mut pool = HandlePool::new();
+        pool.insert(1, 100);
+        pool.insert(2, 200);
+        // Re-insert ino=1 with new handle (e.g. replacing read with write)
+        let result = pool.insert(1, 101);
+        assert_eq!(result.replaced, Some(100), "old handle should be returned for release");
+        assert!(result.evicted.is_none());
+
+        assert_eq!(pool.get(1), Some(101));
+        // order should have exactly 2 entries, not 3
+        assert_eq!(pool.order.len(), 2);
+    }
+
+    #[test]
+    fn handle_pool_get_promotes_to_mru() {
+        let mut pool = HandlePool::new();
+        pool.insert(1, 100);
+        pool.insert(2, 200);
+        pool.insert(3, 300);
+
+        // Access ino=1 (oldest), promoting it to MRU
+        pool.get(1);
+
+        // Fill pool to capacity, then insert one more
+        for i in 4..=HANDLE_POOL_CAPACITY as u64 {
+            pool.insert(i, i * 100);
+        }
+        let result = pool.insert(999, 9999);
+        // ino=2 should be evicted (oldest after ino=1 was promoted)
+        assert_eq!(result.evicted, Some((2, 200)));
+    }
+
+    #[test]
+    fn handle_pool_remove() {
+        let mut pool = HandlePool::new();
+        pool.insert(1, 100);
+        pool.insert(2, 200);
+        pool.insert(3, 300);
+
+        pool.remove(2);
+        assert!(pool.get(2).is_none());
+        assert_eq!(pool.order.len(), 2);
+        assert_eq!(pool.handles.len(), 2);
+        // Remaining entries still work
+        assert_eq!(pool.get(1), Some(100));
+        assert_eq!(pool.get(3), Some(300));
+    }
+
+    #[test]
+    fn handle_pool_drain() {
+        let mut pool = HandlePool::new();
+        pool.insert(1, 100);
+        pool.insert(2, 200);
+        pool.insert(3, 300);
+
+        let entries = pool.drain();
+        assert_eq!(entries.len(), 3);
+        assert!(pool.handles.is_empty());
+        assert!(pool.order.is_empty());
+        // Entries contain all inserted pairs
+        assert!(entries.contains(&(1, 100)));
+        assert!(entries.contains(&(2, 200)));
+        assert!(entries.contains(&(3, 300)));
+    }
+
+    #[test]
+    fn handle_pool_remove_nonexistent() {
+        let mut pool = HandlePool::new();
+        pool.insert(1, 100);
+        pool.remove(999); // no-op
+        assert_eq!(pool.get(1), Some(100));
+        assert_eq!(pool.order.len(), 1);
+    }
 }

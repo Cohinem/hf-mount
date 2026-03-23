@@ -250,6 +250,97 @@ async fn flush_pending_deletes(queue: &Mutex<Vec<String>>, hub_client: &dyn HubO
     }
 }
 
+/// Flush a single dirty inode synchronously: upload staging file, commit to Hub,
+/// update inode table with generation-aware dirty clear. Returns Ok(()) on success
+/// or if the inode is not dirty / doesn't exist / has no staging file.
+pub(crate) async fn flush_one(
+    ino: u64,
+    xet_sessions: &dyn XetOps,
+    staging_dir: &StagingDir,
+    hub_client: &dyn HubOps,
+    inodes: &RwLock<InodeTable>,
+) -> Result<(), i32> {
+    let item = {
+        let inode_table = inodes.read().expect("inodes poisoned");
+        let entry = match inode_table.get(ino) {
+            Some(e) if e.is_dirty() && e.nlink > 0 => e,
+            _ => return Ok(()),
+        };
+        let staging_path = staging_dir.path(ino);
+        if !staging_path.exists() {
+            return Ok(());
+        }
+        FlushItem {
+            ino,
+            full_path: entry.full_path.clone(),
+            staging_path,
+            pending_deletes: entry.pending_deletes.clone(),
+            dirty_generation: entry.dirty_generation,
+        }
+    };
+
+    let upload_results = xet_sessions
+        .upload_files(&[item.staging_path.as_path()])
+        .await
+        .map_err(|e| {
+            error!("flush_one upload failed for ino={}: {}", ino, e);
+            libc::EIO
+        })?;
+    let file_info = &upload_results[0];
+
+    // Skip Hub commit if content hasn't changed (same hash as last commit).
+    // This avoids redundant round-trips when fsync is called repeatedly
+    // without new writes (e.g. xfstests write+fsync loops).
+    let same_content = {
+        let inode_table = inodes.read().expect("inodes poisoned");
+        inode_table
+            .get(ino)
+            .is_some_and(|e| e.xet_hash.as_deref() == Some(file_info.hash()))
+    };
+    if same_content && item.pending_deletes.is_empty() {
+        let mut inode_table = inodes.write().expect("inodes poisoned");
+        if let Some(entry) = inode_table.get_mut(ino) {
+            entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
+        }
+        debug!("flush_one: skipped commit for ino={} (same hash)", ino);
+        return Ok(());
+    }
+
+    let mtime_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut ops = vec![BatchOp::AddFile {
+        path: item.full_path.clone(),
+        xet_hash: file_info.hash().to_string(),
+        mtime: mtime_ms,
+        content_type: None,
+    }];
+    for old_path in &item.pending_deletes {
+        ops.push(BatchOp::DeleteFile { path: old_path.clone() });
+    }
+    hub_client.batch_operations(&ops).await.map_err(|e| {
+        error!("flush_one commit failed for {}: {}", item.full_path, e);
+        libc::EIO
+    })?;
+
+    let mut inode_table = inodes.write().expect("inodes poisoned");
+    if let Some(entry) = inode_table.get_mut(ino) {
+        entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
+    }
+
+    info!("flush_one: committed ino={} path={}", ino, item.full_path);
+    Ok(())
+}
+
+struct FlushItem {
+    ino: u64,
+    full_path: String,
+    staging_path: PathBuf,
+    pending_deletes: Vec<String>,
+    dirty_generation: u64,
+}
+
 async fn flush_batch(
     pending: Vec<u64>,
     xet_sessions: &dyn XetOps,
@@ -258,21 +349,17 @@ async fn flush_batch(
     inodes: &RwLock<InodeTable>,
     flush_errors: &Mutex<HashMap<u64, String>>,
 ) {
-    // Dedup by inode (keep last request per ino)
+    // Dedup by inode (keep last request per ino).
+    // Walk backwards so last occurrence wins, then reverse in-place.
     let mut seen = HashSet::new();
-    let deduped: Vec<u64> = pending
-        .into_iter()
-        .rev()
-        .filter(|ino| seen.insert(*ino))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let mut deduped: Vec<u64> = pending.into_iter().rev().filter(|ino| seen.insert(*ino)).collect();
+    deduped.reverse();
 
     debug!("flush_batch: deduped inos = {:?}", deduped);
 
-    // Resolve paths from inode table, skip deleted/non-dirty/unlinked inodes
-    let to_flush: Vec<(u64, String, PathBuf, Vec<String>)> = {
+    // Resolve paths from inode table, skip deleted/non-dirty/unlinked inodes.
+    // Snapshot the dirty_generation so we only clear dirty if no concurrent writer advanced it.
+    let to_flush: Vec<FlushItem> = {
         let inode_table = inodes.read().expect("inodes poisoned");
         deduped
             .into_iter()
@@ -284,8 +371,11 @@ async fn flush_batch(
                         return None;
                     }
                 };
-                if !entry.dirty {
-                    debug!("flush: ino={} path={} not dirty, skipping", ino, entry.full_path);
+                if !entry.is_dirty() || entry.nlink == 0 {
+                    debug!(
+                        "flush: ino={} path={} not dirty or unlinked, skipping",
+                        ino, entry.full_path
+                    );
                     return None;
                 }
                 let staging_path = staging_dir.path(ino);
@@ -295,12 +385,13 @@ async fn flush_batch(
                     flush_errors.lock().expect("flush_errors poisoned").insert(ino, msg);
                     return None;
                 }
-                Some((
+                Some(FlushItem {
                     ino,
-                    entry.full_path.clone(),
+                    full_path: entry.full_path.clone(),
                     staging_path,
-                    entry.pending_deletes.clone(),
-                ))
+                    pending_deletes: entry.pending_deletes.clone(),
+                    dirty_generation: entry.dirty_generation,
+                })
             })
             .collect()
     };
@@ -310,15 +401,15 @@ async fn flush_batch(
     }
 
     // Upload all files through a single upload session
-    let staging_paths: Vec<&std::path::Path> = to_flush.iter().map(|(_, _, p, _)| p.as_path()).collect();
+    let staging_paths: Vec<&std::path::Path> = to_flush.iter().map(|item| item.staging_path.as_path()).collect();
     let upload_results = match xet_sessions.upload_files(&staging_paths).await {
         Ok(results) => results,
         Err(e) => {
             error!("Batch upload failed: {}", e);
             let msg = format!("upload failed: {e}");
             let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-            for (ino, _, _, _) in &to_flush {
-                errs.insert(*ino, msg.clone());
+            for item in &to_flush {
+                errs.insert(item.ino, msg.clone());
             }
             return;
         }
@@ -329,41 +420,34 @@ async fn flush_batch(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Build batch operations — Hub API requires all adds before all deletes
+    // Build batch operations -- Hub API requires all adds before all deletes
     let mut ops = Vec::with_capacity(to_flush.len());
     let mut delete_ops = Vec::new();
-    let mut successes: Vec<(u64, String, u64)> = Vec::new();
 
-    for ((ino, full_path, _, pending_deletes), file_info) in to_flush.iter().zip(upload_results.iter()) {
+    for (item, file_info) in to_flush.iter().zip(upload_results.iter()) {
         info!(
             "Uploaded file ino={} path={} xet_hash={} size={}",
-            ino,
-            full_path,
+            item.ino,
+            item.full_path,
             file_info.hash(),
             file_info.file_size()
         );
 
         ops.push(BatchOp::AddFile {
-            path: full_path.clone(),
+            path: item.full_path.clone(),
             xet_hash: file_info.hash().to_string(),
             mtime: mtime_ms,
             content_type: None,
         });
 
-        // Delete old remote paths left behind by rename of dirty files
-        for old_path in pending_deletes {
+        for old_path in &item.pending_deletes {
             delete_ops.push(BatchOp::DeleteFile { path: old_path.clone() });
         }
-
-        successes.push((*ino, file_info.hash().to_string(), file_info.file_size()));
     }
 
     ops.append(&mut delete_ops);
 
     // Single batch commit (retry once on transient failure since CAS upload already succeeded).
-    // Note: the retry reuses the original ops without re-reading inode state. In theory a
-    // rename/unlink could happen during the 2s window, but that's extremely unlikely and
-    // the next flush cycle would correct it anyway.
     if let Err(e) = hub_client.batch_operations(&ops).await {
         error!("Batch commit failed, retrying in 2s: {}", e);
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -372,30 +456,18 @@ async fn flush_batch(
             error!("Batch commit retry failed: {}", e2);
             let msg = format!("commit failed after retry: {e2}");
             let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-            for (ino, _, _, _) in &to_flush {
-                errs.insert(*ino, msg.clone());
+            for item in &to_flush {
+                errs.insert(item.ino, msg.clone());
             }
-            // Files remain dirty -- will be re-uploaded on next flush or shutdown
             return;
         }
         info!("Batch commit retry succeeded");
     }
 
-    // Update inodes.
-    // BUG: setting dirty=false unconditionally can lose writes from a concurrent
-    // writable handle on the same inode. If handle A flushes and clears dirty,
-    // handle B's subsequent release sees !dirty and skips the flush. Fix requires
-    // a dirty generation counter instead of a bool.
     let mut inode_table = inodes.write().expect("inodes poisoned");
-    let now = SystemTime::now();
-    for (ino, xet_hash, size) in successes {
-        if let Some(entry) = inode_table.get_mut(ino) {
-            entry.xet_hash = Some(xet_hash);
-            entry.size = size;
-            entry.dirty = false;
-            entry.mtime = now;
-            entry.ctime = now;
-            entry.pending_deletes.clear();
+    for (item, file_info) in to_flush.iter().zip(upload_results.iter()) {
+        if let Some(entry) = inode_table.get_mut(item.ino) {
+            entry.apply_commit(file_info.hash(), file_info.file_size(), item.dirty_generation);
         }
     }
 
