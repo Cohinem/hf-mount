@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install hf-mount (NFS backend, no root needed)
+# Install hf-mount
 # Usage: curl -fsSL https://raw.githubusercontent.com/huggingface/hf-mount/main/install.sh | sh
 set -e
 
@@ -22,15 +22,17 @@ case "$ARCH" in
   *)            echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
 esac
 
-BINARY="hf-mount-nfs-${ARCH_TAG}-${PLATFORM}"
-URL="https://github.com/${REPO}/releases/latest/download/${BINARY}"
-
-echo "Downloading ${BINARY}..."
+BASE_URL="https://github.com/${REPO}/releases/latest/download"
 mkdir -p "$INSTALL_DIR"
-curl -fSL "$URL" -o "${INSTALL_DIR}/hf-mount-nfs"
-chmod +x "${INSTALL_DIR}/hf-mount-nfs"
 
-echo "Installed hf-mount-nfs to ${INSTALL_DIR}/hf-mount-nfs"
+for bin in hf-mount hf-mount-nfs; do
+  BINARY="${bin}-${ARCH_TAG}-${PLATFORM}"
+  echo "Downloading ${BINARY}..."
+  curl -fSL "${BASE_URL}/${BINARY}" -o "${INSTALL_DIR}/${bin}"
+  chmod +x "${INSTALL_DIR}/${bin}"
+done
+
+echo "Installed hf-mount and hf-mount-nfs to ${INSTALL_DIR}/"
 
 # Check if install dir is in PATH
 case ":$PATH:" in
