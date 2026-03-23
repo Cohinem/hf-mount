@@ -14,11 +14,7 @@ Also works with any model or dataset repo (read-only):
 hf-mount start repo openai/gpt-oss-20b /tmp/gpt-oss
 ```
 
-Commands will pick up your HF_TOKEN from env if present, or you can pass it explicitly:
-
-```bash
-hf-mount --hf-token $HF_TOKEN 
-```
+Commands will pick up your `HF_TOKEN` from the environment, or you can pass it explicitly with `--hf-token`.
 
 Then use your local folders as usual:
 ```python
@@ -44,7 +40,7 @@ Agentic storage: Agents don't require complex APIs or SDKs, they thrive on the f
 curl -fsSL https://raw.githubusercontent.com/huggingface/hf-mount/main/install.sh | sh
 ```
 
-Installs `hf-mount` to `~/.local/bin/`. Set `INSTALL_DIR` to change the location. Supports Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel).
+Installs `hf-mount` to `~/.local/bin/`. Set `INSTALL_DIR` to change the location. Supports Linux (x86_64, aarch64) and macOS (Apple Silicon).
 
 ### Manual download
 
@@ -60,7 +56,7 @@ Binaries are available on [GitHub Releases](https://github.com/huggingface/hf-mo
 
 The NFS backend has no system dependencies. For FUSE:
 
-**Linux**: `sudo apt-get install -y fuse3`
+**Linux**: `sudo apt-get install -y fuse3` (pre-built binaries only need the runtime; building from source also requires `libfuse3-dev`)
 
 **macOS**: install [macFUSE](https://osxfuse.github.io/) (`brew install macfuse`, requires reboot on first install)
 
@@ -158,7 +154,7 @@ hf-mount-nfs repo gpt2 /tmp/gpt2
 hf-mount-fuse --hf-token $HF_TOKEN bucket myuser/my-bucket /mnt/data
 ```
 
-#### macOS: launch as a daemon with launchd
+### macOS: launch as a daemon with launchd
 
 To have `hf-mount` start automatically on login, create a LaunchAgent:
 
