@@ -14,7 +14,7 @@ jobs:
   build-linux:
     name: Build Linux (${{ matrix.target }})
     runs-on:
-      group: hf-mount-ci
+      group: hf-mount-ci-pub
     strategy:
       matrix:
         include:
