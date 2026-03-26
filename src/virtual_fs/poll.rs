@@ -14,6 +14,7 @@ impl super::VirtualFs {
     pub(super) async fn poll_remote_changes(
         hub_client: Arc<dyn HubOps>,
         inodes: Arc<RwLock<InodeTable>>,
+        open_files: Arc<RwLock<HashMap<u64, super::OpenFile>>>,
         negative_cache: Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: Invalidator,
         interval: Duration,
@@ -59,7 +60,14 @@ impl super::VirtualFs {
                     }
                 }
             }
-            Self::apply_poll_diff(all_entries, &polled_prefixes, &inodes, &negative_cache, &invalidator);
+            Self::apply_poll_diff(
+                all_entries,
+                &polled_prefixes,
+                &inodes,
+                &open_files,
+                &negative_cache,
+                &invalidator,
+            );
         }
     }
 
@@ -74,6 +82,7 @@ impl super::VirtualFs {
         remote_entries: Vec<crate::hub_api::TreeEntry>,
         polled_prefixes: &HashSet<String>,
         inodes: &Arc<RwLock<InodeTable>>,
+        open_files: &Arc<RwLock<HashMap<u64, super::OpenFile>>>,
         negative_cache: &Arc<RwLock<HashMap<String, Instant>>>,
         invalidator: &Invalidator,
     ) {
@@ -165,19 +174,28 @@ impl super::VirtualFs {
             }
 
             for ino in &deletions {
-                // Re-check dirty status under the write lock: a local write
-                // may have dirtied this inode between the read-lock snapshot
-                // and now. Dirty inodes must not be removed, as that would
-                // discard uncommitted local data (TOCTOU race).
-                if let Some(entry) = inode_table.get(*ino) {
-                    if entry.is_dirty() {
-                        continue;
-                    }
-                    let parent_ino = entry.parent;
-                    inos_to_invalidate.push(parent_ino);
+                // Re-check under write lock: inode may have been removed or
+                // dirtied between the read-lock snapshot and now.
+                let (parent_ino, name) = match inode_table.get(*ino) {
+                    Some(entry) if entry.is_dirty() => continue,
+                    Some(entry) => (entry.parent, entry.name.clone()),
+                    None => continue,
+                };
+                if super::has_open_handles_for(open_files, *ino) {
+                    // Unlink the pathname but keep the inode as orphan (nlink=0)
+                    // so open handles can still read/fstat. release() will clean
+                    // up the orphan. Without this, the file stays visible by name
+                    // and a recreated file at the same path would collide.
+                    inode_table.unlink_one(parent_ino, &name);
+                    info!(
+                        "Remote deletion of ino={}: unlinked path, kept orphan (open handles)",
+                        ino
+                    );
+                } else {
+                    inode_table.remove(*ino);
                 }
+                inos_to_invalidate.push(parent_ino);
                 inos_to_invalidate.push(*ino);
-                inode_table.remove(*ino);
             }
 
             // Phase 3: New remote entries (files AND directories) -> invalidate parent dir.
