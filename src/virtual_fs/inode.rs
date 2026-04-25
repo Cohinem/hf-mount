@@ -1,4 +1,4 @@
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -344,7 +344,7 @@ impl InodeTable {
     /// we actually return — O(N log max) with max cloned Strings, vs the
     /// naive sort-and-truncate that allocates for every filter-passing
     /// entry before discarding most of them.
-    pub(crate) fn lru_candidates(&self, max: usize) -> Vec<(u64, String)> {
+    pub(crate) fn lru_candidates(&self, max: usize) -> Vec<(u64, u64, String)> {
         if max == 0 {
             return Vec::new();
         }
@@ -353,7 +353,12 @@ impl InodeTable {
         // remains is the `max` oldest.
         let mut heap: BinaryHeap<(u64, u64)> = BinaryHeap::with_capacity(max + 1);
         for e in self.inodes.values() {
-            if e.kind != InodeKind::File || e.nlink == 0 || e.is_dirty() || !e.pending_deletes.is_empty() {
+            if e.kind != InodeKind::File
+                || e.nlink == 0
+                || e.is_dirty()
+                || !e.pending_deletes.is_empty()
+                || e.eviction.open_handles.load(Ordering::Relaxed) > 0
+            {
                 continue;
             }
             heap.push((e.eviction.last_touched.load(Ordering::Relaxed), e.inode));
@@ -367,7 +372,7 @@ impl InodeTable {
         picks.sort_by_key(|&(ts, _)| ts);
         picks
             .into_iter()
-            .filter_map(|(_, ino)| self.inodes.get(&ino).map(|e| (e.parent, e.name.clone())))
+            .filter_map(|(_, ino)| self.inodes.get(&ino).map(|e| (ino, e.parent, e.name.clone())))
             .collect()
     }
 
@@ -409,6 +414,48 @@ impl InodeTable {
             parent.children_loaded = false;
         }
         true
+    }
+
+    /// Batched counterpart to `evict_if_safe`. Re-checks the safety
+    /// predicate (including `open_handles == 0` — a concurrent `open()`
+    /// may have bumped it after the candidate scan), removes the eligible
+    /// inodes, then issues a single `parent.children.retain()` per touched
+    /// parent. Returns the inos actually evicted so the caller can clean
+    /// up per-inode external state (e.g. staging files).
+    pub(crate) fn evict_batch_if_safe(&mut self, inos: &[u64]) -> Vec<u64> {
+        let mut by_parent: HashMap<u64, HashSet<u64>> = HashMap::new();
+        for &ino in inos {
+            let eligible = self.inodes.get(&ino).is_some_and(|e| {
+                e.kind == InodeKind::File
+                    && e.eviction.nlookup.load(Ordering::Relaxed) == 0
+                    && e.eviction.open_handles.load(Ordering::Relaxed) == 0
+                    && !e.is_dirty()
+                    && e.pending_deletes.is_empty()
+                    && e.nlink > 0
+            });
+            if eligible && let Some(e) = self.inodes.get(&ino) {
+                by_parent.entry(e.parent).or_default().insert(ino);
+            }
+        }
+
+        let mut evicted = Vec::new();
+        for set in by_parent.values() {
+            for &ino in set {
+                if let Some(entry) = self.inodes.remove(&ino) {
+                    self.path_to_inode.remove(&*entry.full_path);
+                    evicted.push(ino);
+                }
+            }
+        }
+        for (parent_ino, evicted_set) in &by_parent {
+            if let Some(parent) = self.inodes.get_mut(parent_ino) {
+                parent.children.retain(|c| !evicted_set.contains(&c.ino));
+                // Force readdir to re-fetch the listing so evicted inodes can
+                // be re-materialized on next access.
+                parent.children_loaded = false;
+            }
+        }
+        evicted
     }
 
     pub fn get_by_path(&self, path: &str) -> Option<&InodeEntry> {
@@ -1940,6 +1987,136 @@ mod tests {
         let root = table.get(ROOT_INODE).unwrap();
         assert!(!root.children_loaded);
         assert!(!root.children.iter().any(|c| c.ino == ino));
+    }
+
+    #[test]
+    fn test_evict_batch_if_safe_groups_by_parent() {
+        let mut table = InodeTable::new(0);
+        // Two parent dirs each with 5 files.
+        let mut all = Vec::new();
+        for parent_name in ["a", "b"] {
+            let parent_ino = table.insert(
+                ROOT_INODE,
+                parent_name.to_string(),
+                parent_name.to_string(),
+                InodeKind::Directory,
+                0,
+                UNIX_EPOCH,
+                None,
+                0o755,
+                0,
+                0,
+            );
+            for i in 0..5 {
+                let ino = table.insert(
+                    parent_ino,
+                    format!("f{i}.txt"),
+                    format!("{parent_name}/f{i}.txt"),
+                    InodeKind::File,
+                    1,
+                    UNIX_EPOCH,
+                    None,
+                    0o644,
+                    0,
+                    0,
+                );
+                all.push((parent_ino, ino));
+            }
+        }
+
+        let inos: Vec<u64> = all.iter().map(|(_, ino)| *ino).collect();
+        assert_eq!(
+            table.evict_batch_if_safe(&inos).len(),
+            10,
+            "all 10 files should be evicted"
+        );
+
+        for (parent_ino, ino) in all {
+            assert!(table.get(ino).is_none(), "evicted ino must be gone");
+            let parent = table.get(parent_ino).unwrap();
+            assert!(parent.children.is_empty(), "parent's children list cleared");
+            assert!(!parent.children_loaded, "children_loaded reset");
+        }
+    }
+
+    /// Mirrors the sweep race: candidate selection sees `open_handles == 0`,
+    /// then a concurrent `open()` bumps the counter before the batch runs
+    /// under the write lock. The batch must refuse to evict.
+    #[test]
+    fn test_evict_batch_if_safe_refuses_when_open_handles_bumped_after_scan() {
+        let mut table = InodeTable::new(0);
+        let ino = table.insert(
+            ROOT_INODE,
+            "racer.txt".to_string(),
+            "racer.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table
+            .get(ino)
+            .unwrap()
+            .eviction
+            .open_handles
+            .fetch_add(1, Ordering::Relaxed);
+
+        let evicted = table.evict_batch_if_safe(&[ino]);
+        assert!(evicted.is_empty(), "batch must skip an inode with live handles");
+        assert!(table.get(ino).is_some(), "inode must remain in the table");
+    }
+
+    #[test]
+    fn test_evict_batch_if_safe_filters_unsafe() {
+        let mut table = InodeTable::new(0);
+        let safe = table.insert(
+            ROOT_INODE,
+            "safe.txt".to_string(),
+            "safe.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        let dirty = table.insert(
+            ROOT_INODE,
+            "dirty.txt".to_string(),
+            "dirty.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        if let Some(e) = table.get_mut(dirty) {
+            e.set_dirty();
+        }
+        let pinned = table.insert(
+            ROOT_INODE,
+            "pinned.txt".to_string(),
+            "pinned.txt".to_string(),
+            InodeKind::File,
+            1,
+            UNIX_EPOCH,
+            None,
+            0o644,
+            0,
+            0,
+        );
+        table.bump_nlookup(pinned);
+
+        assert_eq!(table.evict_batch_if_safe(&[safe, dirty, pinned]), vec![safe]);
+        assert!(table.get(safe).is_none());
+        assert!(table.get(dirty).is_some(), "dirty file must stay");
+        assert!(table.get(pinned).is_some(), "pinned (nlookup>0) must stay");
     }
 
     #[test]

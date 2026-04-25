@@ -284,7 +284,7 @@ impl VirtualFs {
             let evicted = vfs.lru_evict_sweep(soft_limit);
             if evicted > 0 || table_len > soft_limit {
                 info!(
-                    "lru_sweep: table={} soft_limit={} invalidated={}",
+                    "lru_sweep: table={} soft_limit={} evicted={}",
                     table_len, soft_limit, evicted
                 );
             }
@@ -293,9 +293,12 @@ impl VirtualFs {
 
     /// Candidates are collected under a read lock, then released before
     /// invoking `cb` — `cb` writes to the FUSE notify channel and returns
-    /// `false` on EAGAIN/ENOMEM, which `take_while` uses as the batch
-    /// throttle. Unacked candidates aren't lost: their `last_touched`
-    /// doesn't move, so the next sweep picks them up again.
+    /// `false` on EAGAIN/ENOMEM, which acts as the natural batch throttle.
+    ///
+    /// After `inval_entry`, we also evict our own table entry if `evict_if_safe`
+    /// lets us: when the inode was materialized from a readdir the kernel
+    /// never cached a dentry for it (nlookup stays at 0), so no `forget()`
+    /// will ever come back. Waiting on one leaks the entry forever.
     fn lru_evict_sweep(&self, soft_limit: usize) -> usize {
         let candidates = {
             let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -305,10 +308,43 @@ impl VirtualFs {
             }
             inodes.lru_candidates(len - soft_limit)
         };
-        let Some(cb) = self.entry_invalidator.get() else {
+        let Some(invalidate_entry) = self.entry_invalidator.get() else {
             return 0;
         };
-        candidates.into_iter().take_while(|(p, n)| cb(*p, n)).count()
+
+        let mut to_evict = Vec::with_capacity(candidates.len());
+        for (ino, parent, name) in candidates {
+            // `invalidate_entry` returns false when the FUSE notify channel
+            // is saturated (EAGAIN/ENOMEM) — backpressure, stop the sweep.
+            if !invalidate_entry(parent, &name) {
+                break;
+            }
+            to_evict.push(ino);
+        }
+
+        if to_evict.is_empty() {
+            return 0;
+        }
+        // Evict in chunks so the write lock is released between batches —
+        // a single huge batch could hold it for hundreds of ms, stalling
+        // every concurrent lookup / readdir / forget. `evict_batch_if_safe`
+        // also collapses the per-eviction `parent.children.retain()` into
+        // one pass per touched parent, which matters when many evicted
+        // siblings share the same dir.
+        const EVICT_CHUNK: usize = 4096;
+        let mut total_evicted = 0;
+        for chunk in to_evict.chunks(EVICT_CHUNK) {
+            let evicted_inos = {
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                inodes.evict_batch_if_safe(chunk)
+            };
+            // Reclaim per-inode staging files, mirroring forget()/release().
+            for ino in &evicted_inos {
+                self.drop_staging(*ino);
+            }
+            total_evicted += evicted_inos.len();
+        }
+        total_evicted
     }
 
     /// Graceful shutdown: abort polling, drain flush queue, wait for completion.
