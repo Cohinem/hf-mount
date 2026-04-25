@@ -145,6 +145,12 @@ pub struct MountOptions {
     #[arg(long, default_value_t = false)]
     pub no_filter_os_files: bool,
 
+    /// Optimize for media streaming. Disables aggressive readahead, reduces
+    /// concurrency, and strictly adheres to read request ranges to save
+    /// bandwidth and provide stable playback. Implies `--no-disk-cache`.
+    #[arg(long, default_value_t = false)]
+    pub streaming_mode: bool,
+
     /// Restrict mount access to the mounting user only (FUSE only).
     /// By default all users can access the mount.
     /// When not set, requires `user_allow_other` in /etc/fuse.conf on Linux.
@@ -188,12 +194,27 @@ pub struct MountSetup {
     pub max_threads: usize,
     pub metadata_ttl_ms: u64,
     pub fuse_owner_only: bool,
+    pub streaming_mode: bool,
 }
 
 // ── Tracing + env vars (no threads) ──────────────────────────────────
 
 /// Initialize tracing and xet-core env vars.
 /// No threads are spawned. Safe to fork() after this returns.
+pub fn tune_for_streaming() {
+    let streaming_vars = [
+        ("HF_XET_CLIENT_AC_INITIAL_DOWNLOAD_CONCURRENCY", "2"),
+        ("HF_XET_RECONSTRUCTION_MIN_RECONSTRUCTION_FETCH_SIZE", "1048576"),
+        ("HF_XET_RECONSTRUCTION_MIN_PREFETCH_BUFFER", "1048576"),
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_SIZE", "16777216"),
+        ("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "33554432"),
+    ];
+    for (k, v) in streaming_vars {
+        // Force overwrite for streaming mode
+        unsafe { std::env::set_var(k, v) };
+    }
+}
+
 pub fn init_tracing(daemon: bool) {
     // Use RUST_LOG if set, otherwise default to hf_mount=info.
     let filter = if std::env::var("RUST_LOG").is_ok() {
@@ -270,6 +291,11 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         }
     };
 
+    if options.streaming_mode {
+        tune_for_streaming();
+        info!("Tuned environment variables for streaming mode");
+    }
+
     let backend = if is_nfs { "nfs" } else { "fuse" };
     let hub_client = runtime.block_on(async {
         HubApiClient::from_source(
@@ -305,7 +331,8 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     std::fs::create_dir_all(&options.cache_dir)
         .unwrap_or_else(|e| panic!("Failed to create cache dir {:?}: {e}", options.cache_dir));
 
-    let xorb_cache = if options.no_disk_cache {
+    let disable_disk_cache = options.no_disk_cache || options.streaming_mode;
+    let xorb_cache = if disable_disk_cache {
         None
     } else {
         let xorbs_dir = options.cache_dir.join("xorbs");
@@ -371,20 +398,21 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     info!(
         "Config: advanced_writes={} direct_io={} poll_interval={}s metadata_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} max_threads={} \
-         flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
+         flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={} streaming_mode={}",
         advanced_writes,
         options.direct_io,
         options.poll_interval_secs,
         options.metadata_ttl_ms,
         options.cache_dir,
         options.cache_size,
-        options.no_disk_cache,
+        options.no_disk_cache || options.streaming_mode,
         options.max_threads,
         options.flush_debounce_ms,
         options.flush_max_batch_window_ms,
         uid,
         gid,
         !options.no_filter_os_files,
+        options.streaming_mode
     );
 
     let metadata_ttl = std::time::Duration::from_millis(options.metadata_ttl_ms);
@@ -412,6 +440,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
             // only exist on the FUSE side, so force the limit off here.
             inode_soft_limit: if is_nfs { 0 } else { options.inode_soft_limit },
             lru_sweep_interval: std::time::Duration::from_millis(options.lru_sweep_interval_ms),
+            streaming_mode: options.streaming_mode,
         },
     );
 
@@ -426,6 +455,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         max_threads: options.max_threads,
         metadata_ttl_ms: options.metadata_ttl_ms,
         fuse_owner_only: options.fuse_owner_only,
+        streaming_mode: options.streaming_mode,
     }
 }
 
