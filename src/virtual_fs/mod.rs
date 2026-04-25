@@ -70,6 +70,7 @@ pub struct VfsConfig {
     /// 0 disables the LRU evictor.
     pub inode_soft_limit: usize,
     pub lru_sweep_interval: Duration,
+    pub streaming_mode: bool,
 }
 
 /// Lock ordering (acquire in this order to prevent deadlocks):
@@ -142,6 +143,7 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
+    streaming_mode: bool,
 }
 
 /// Where to read file content from when opening read-only.
@@ -221,6 +223,7 @@ impl VirtualFs {
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
+            streaming_mode: config.streaming_mode,
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -1388,6 +1391,7 @@ impl VirtualFs {
             xet_hash,
             size,
             self.direct_io,
+            self.streaming_mode,
         )));
         let file_handle = self.alloc_file_handle();
         self.inode_table.read().expect("inodes poisoned").bump_open_handles(ino);

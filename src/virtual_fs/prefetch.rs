@@ -82,10 +82,11 @@ pub(crate) struct PrefetchState {
     pub(crate) stream: Option<Box<dyn DownloadStreamOps>>,
     /// When true, drain consumed bytes after serving (no re-read from buffer).
     forward_only: bool,
+    streaming_mode: bool,
 }
 
 impl PrefetchState {
-    pub(crate) fn new(xet_hash: String, file_size: u64, forward_only: bool) -> Self {
+    pub(crate) fn new(xet_hash: String, file_size: u64, forward_only: bool, streaming_mode: bool) -> Self {
         Self {
             xet_hash,
             file_size,
@@ -95,9 +96,10 @@ impl PrefetchState {
             buf_start: 0,
             seek_data: VecDeque::new(),
             seek_start: 0,
-            window_size: INITIAL_WINDOW,
+            window_size: if streaming_mode { 4 * 1_048_576 } else { INITIAL_WINDOW },
             stream: None,
             forward_only,
+            streaming_mode,
         }
     }
 
@@ -114,12 +116,16 @@ impl PrefetchState {
         }
 
         // Classify access pattern and adjust window
+        let forward_skip_allowed = if self.streaming_mode { 0 } else { FORWARD_SKIP };
+
         let is_sequential = if is_first_fetch {
             true
-        } else if offset >= old_buf_end && offset <= old_buf_end + FORWARD_SKIP {
+        } else if offset >= old_buf_end && offset <= old_buf_end + forward_skip_allowed {
             // Sequential or small forward skip: double window (TCP slow-start)
-            self.window_size = (self.window_size * 2).min(MAX_WINDOW);
-            debug!("prefetch window doubled to {}", self.window_size);
+            if !self.streaming_mode {
+                self.window_size = (self.window_size * 2).min(MAX_WINDOW);
+                debug!("prefetch window doubled to {}", self.window_size);
+            }
             true
         } else {
             // Far seek (backward, or forward jump > FORWARD_SKIP): treat as random.
@@ -128,7 +134,7 @@ impl PrefetchState {
             // contiguous read will hit is_sequential and restart streaming with
             // window=INITIAL. This is a good default for mmap/safetensors workloads
             // which are heavily random — avoids wasting ~8MB of prefetch on every seek.
-            self.window_size = INITIAL_WINDOW;
+            self.window_size = if self.streaming_mode { 4 * 1_048_576 } else { INITIAL_WINDOW };
             debug!("prefetch window reset to {}", self.window_size);
             false
         };
@@ -166,7 +172,13 @@ impl PrefetchState {
         // extra bytes are likely wasted on the next random seek.
         let fetch_size = match strategy {
             FetchStrategy::RangeDownload => needed,
-            _ => needed.max(self.window_size),
+            _ => if self.streaming_mode {
+                // In streaming mode, be strict about what we prefetch
+                // Don't prefetch more than window_size or what's requested + small buffer
+                needed.max(self.window_size).min(needed + 4 * 1_048_576)
+            } else {
+                needed.max(self.window_size)
+            },
         }
         .min(self.file_size - offset);
 
@@ -321,7 +333,7 @@ mod tests {
 
     /// Helper: create a PrefetchState pre-loaded with chunks at a given offset.
     fn ps_with_chunks(buf_start: u64, chunks: &[&[u8]]) -> PrefetchState {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, false);
         ps.buf_start = buf_start;
         for chunk in chunks {
             let b = Bytes::copy_from_slice(chunk);
@@ -382,7 +394,7 @@ mod tests {
     #[test]
     fn seek_window_basic() {
         // Backward seek window serves previously consumed bytes.
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, false);
         ps.seek_data.extend(&[10, 20, 30, 40, 50]);
         ps.seek_start = 100;
         let result = ps.try_serve_seek(102, 2).unwrap();
@@ -391,7 +403,7 @@ mod tests {
 
     #[test]
     fn seek_window_out_of_range() {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, false);
         ps.seek_data.extend(&[1, 2, 3]);
         ps.seek_start = 100;
         assert!(ps.try_serve_seek(99, 1).is_none());
@@ -451,7 +463,7 @@ mod tests {
 
     #[test]
     fn empty_buffer() {
-        let mut ps = PrefetchState::new("hash".into(), 100, false);
+        let mut ps = PrefetchState::new("hash".into(), 100, false, false);
         assert!(ps.try_serve_forward(0, 10).is_none());
     }
 
@@ -468,7 +480,7 @@ mod tests {
     #[test]
     fn seek_zero_size() {
         // A zero-size seek read at a valid offset should return Some(empty).
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, false, false);
         ps.seek_data.extend(&[1, 2, 3]);
         ps.seek_start = 0;
         let result = ps.try_serve_seek(0, 0).unwrap();
@@ -529,7 +541,7 @@ mod tests {
     // ── Forward-only mode tests ─────────────────────────────────────
 
     fn ps_forward_only(buf_start: u64, chunks: &[&[u8]]) -> PrefetchState {
-        let mut ps = PrefetchState::new("hash".into(), u64::MAX, true);
+        let mut ps = PrefetchState::new("hash".into(), u64::MAX, true, false);
         ps.buf_start = buf_start;
         for chunk in chunks {
             let b = Bytes::copy_from_slice(chunk);

@@ -510,6 +510,7 @@ pub fn make_test_vfs(
             flush_max_batch_window: Duration::from_secs(1),
             inode_soft_limit: opts.inode_soft_limit,
             lru_sweep_interval: Duration::from_millis(50),
+            streaming_mode: false,
         },
     )
 }
